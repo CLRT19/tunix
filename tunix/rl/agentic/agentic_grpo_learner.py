@@ -59,7 +59,7 @@ MetricFn = agentic_rl_learner.MetricFn
 TrainExample = agentic_rl_learner.TrainExample
 
 
-@dataclasses.dataclass(slots=True, kw_only=True)
+@dataclasses.dataclass(kw_only=True)
 class GRPOConfig(agentic_rl_learner.AgenticRLConfig):
   """Configuration for GRPO algorithm.
 
@@ -215,6 +215,10 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
       )
     else:
       logging.warning("Metrics log dir is None, skipping trajectory logging.")
+
+    self.algo_config.temperature = self.rl_cluster.get_rollout_config(
+        mode=rl_cluster_lib.Mode.TRAIN
+    ).temperature
 
     # Workaround to pass loss fn with algorithm flag
     policy_loss_fn = function_registry.get_policy_loss_fn(
@@ -611,6 +615,7 @@ def grpo_loss_fn(
       return_logits=True,
       segment_ids=getattr(train_example, "segment_ids", None),
       segment_positions=getattr(train_example, "segment_positions", None),
+      temperature=algo_config.temperature,
   )
   per_token_logps = jnp.astype(per_token_logps, jnp.float32)
   # TODO(tsbao): We should handle token level advantages.

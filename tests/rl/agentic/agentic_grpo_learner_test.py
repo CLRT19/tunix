@@ -441,6 +441,7 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         epsilon=0.2,
         loss_algo=loss_algo,
     )
+    algo_config.temperature = 1.0
     policy_loss_fn = function_registry.get_policy_loss_fn(
         algo_config.policy_loss_fn
     )
@@ -524,6 +525,7 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         loss_algo="grpo",
         loss_agg_mode="token-mean",
     )
+    config.temperature = 0.5
 
     policy_loss_fn = function_registry.get_policy_loss_fn(config.policy_loss_fn)
 

@@ -180,7 +180,7 @@ def get_per_token_logps(
       positions=positions,
       attention_mask=attn_mask,
       cache=None,
-      **kwargs
+      **kwargs,
   )
   logits = logits[:, -logits_to_keep - 1 : -1, :]
   input_tokens = input_tokens[:, -logits_to_keep:]
@@ -244,7 +244,13 @@ def process_ids(
 
 @partial(
     jax.jit,
-    static_argnames=("pad_id", "eos_id", "stop_gradient", "return_logits"),
+    static_argnames=(
+        "pad_id",
+        "eos_id",
+        "stop_gradient",
+        "return_logits",
+        "temperature",
+    ),
 )
 def compute_per_token_logps(
     graphdef,
@@ -259,6 +265,7 @@ def compute_per_token_logps(
     return_logits: bool = False,
     segment_ids: jax.Array | None = None,
     segment_positions: jax.Array | None = None,
+    temperature: float = 1.0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Computes the per-token log probabilities.
 
@@ -280,6 +287,7 @@ def compute_per_token_logps(
     return_logits: whether to return logits.
     segment_ids: optional 1D sequential document identifiers used for packing.
     segment_positions: optional 1D local position indices used for packing.
+    temperature: temperature used for rollout.
 
   Returns:
     per_token_logps: jax.Array token-level logarithmic values.
@@ -323,6 +331,9 @@ def compute_per_token_logps(
     logits_to_keep = completion_tokens.shape[1]
 
   logits = logits[:, -logits_to_keep - 1 : -1, :]
+  if temperature != 0.0 and temperature != 1.0:
+    logits /= temperature
+
   input_tokens_to_keep = input_tokens[:, -logits_to_keep:]
   per_token_logps = selective_log_softmax(logits, input_tokens_to_keep)
 

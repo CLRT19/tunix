@@ -977,6 +977,7 @@ class RLCluster:
       self._maybe_load_model_from_cpu(
           self.inference_worker.get_model("reference"), Role.REFERENCE
       )
+      temperature = self.get_rollout_config(mode=Mode.TRAIN).temperature
       outs = []
       for batch_slice in rl_utils.chunk_slices_by_size(
           stop=batch_size, step=micro_batch_size
@@ -990,6 +991,7 @@ class RLCluster:
                 completion_mask=None
                 if completion_mask is None
                 else completion_mask[batch_slice],
+                temperature=temperature,
             )
         )
       ref_per_token_logps = jnp.concatenate(outs, axis=0)
@@ -1087,6 +1089,13 @@ class RLCluster:
           pad_id,
           eos_id,
       )
+
+  def get_rollout_config(self, mode: Mode) -> base_rollout.RolloutConfig:
+    """Returns the rollout config for the given mode."""
+    if isinstance(self.cluster_config.rollout_config, dict):
+      return self.cluster_config.rollout_config[mode]
+    else:
+      return self.cluster_config.rollout_config
 
   @contextlib.contextmanager
   def _get_mesh_and_logical_axis_rules_cm(self, role: Role):

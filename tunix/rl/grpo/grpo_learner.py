@@ -42,7 +42,7 @@ class TrainExample(common.TrainExample):
   pass
 
 
-@dataclasses.dataclass(slots=True, kw_only=True)
+@dataclasses.dataclass(kw_only=True)
 class GRPOConfig(algo_config_lib.AlgorithmConfig):
   """Configuration for GRPO algorithms.
 
@@ -56,9 +56,8 @@ class GRPOConfig(algo_config_lib.AlgorithmConfig):
     loss_algo: The loss algorithm to use. To be deprecated.
     num_generations: The number of times the policy generates multiple responses
       for a given prompt within a single training step. This corresponds to 'G'
-      in Algorithm 1 in the `paper
-      <https://arxiv.org/abs/2402.03300>`_.
-      A higher value means more samples are used to compute relative advantages.
+      in Algorithm 1 in the `paper <https://arxiv.org/abs/2402.03300>`_. A
+      higher value means more samples are used to compute relative advantages.
     num_iterations: The number of iterations per batch (𝜇 in GRPO algo 1).
     beta: The coefficient for the KL divergence penalty (𝛽) in the GRPO loss
       function. This term prevents policy updates from deviating too far from
@@ -161,6 +160,10 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
         data_shuffle_seed=data_shuffle_seed,
     )
 
+    self.algo_config.temperature = self.rl_cluster.get_rollout_config(
+        mode=rl_cluster_lib.Mode.TRAIN
+    ).temperature
+
     policy_loss_fn = function_registry.get_policy_loss_fn(
         self.algo_config.policy_loss_fn
     )
@@ -186,8 +189,8 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
         }
     )
     self.rl_cluster.actor_trainer.with_rl_metrics_to_log({
-      "kl": np.mean,
-      "pg_clipfrac": np.mean,
+        "kl": np.mean,
+        "pg_clipfrac": np.mean,
     })
     self.rl_cluster.actor_trainer.with_tqdm_metrics_to_display([
         lambda: "kl" if self.algo_config.beta != 0.0 else None,
@@ -504,6 +507,7 @@ def grpo_loss_fn(
       return_logits=False,
       segment_ids=getattr(train_example, "segment_ids", None),
       segment_positions=getattr(train_example, "segment_positions", None),
+      temperature=algo_config.temperature,
   )
   advantages = train_example.advantages
 
@@ -558,8 +562,8 @@ def grpo_loss_fn(
     )
 
   aux = {
-    "kl": mean_kl,
-    "pg_clipfrac": pg_clipfrac,
+      "kl": mean_kl,
+      "pg_clipfrac": pg_clipfrac,
   }
 
   loss = common.aggregate_loss(
