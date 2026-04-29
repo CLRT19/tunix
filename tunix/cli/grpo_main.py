@@ -553,7 +553,8 @@ class GrpoPipeline(config.HyperParameters):
       max_steps = allowed_max_steps
     elif max_steps > allowed_max_steps:
       raise ValueError(
-          "Maximum allowed value for max_steps is %d", allowed_max_steps
+          f"Maximum allowed value for max_steps is {allowed_max_steps}, but"
+          f" {max_steps} is specified."
       )
 
     rl_training_config["max_steps"] = max_steps
