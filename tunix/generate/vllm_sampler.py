@@ -258,6 +258,25 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
     args["data_parallel_size"] = dp
 
     device_indexes = config.mesh.device_ids.flatten().tolist()
+    if os.environ.get("TUNIX_VLLM_USE_LOCAL_TPU_DEVICE_IDS", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+      local_device_ids = [device.id for device in jax.local_devices()]
+      total_devices = tp * dp * ep
+      if len(local_device_ids) < total_devices:
+        raise ValueError(
+            "TUNIX_VLLM_USE_LOCAL_TPU_DEVICE_IDS=1 requested "
+            f"{total_devices} vLLM TPU devices, but this host only has "
+            f"{len(local_device_ids)} local JAX devices: {local_device_ids}."
+        )
+      device_indexes = local_device_ids[:total_devices]
+      logging.info(
+          "Using local TPU device IDs for vLLM sharding: %s",
+          device_indexes,
+      )
     args["additional_config"]["sharding"] = {
         "sharding_strategy": {
             "expert_parallelism": ep,

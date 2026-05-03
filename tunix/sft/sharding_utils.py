@@ -54,13 +54,12 @@ def shard_input(
   if all(jax.tree.leaves(is_sharded)):
     return input_data
 
+  def shard_leaf(x):
+    sharding = get_sharding(x, mesh=mesh, pspec=pspec)
+    return jax.device_put(x, sharding)
+
   with jax.transfer_guard("allow"):
-    return jax.tree.map(
-        lambda x: jax.make_array_from_process_local_data(
-            get_sharding(x, mesh=mesh, pspec=pspec), x
-        ),
-        input_data,
-    )
+    return jax.tree.map(shard_leaf, input_data)
 
 
 def get_sharding(x: jax.Array, mesh: shd.Mesh, pspec: shd.PartitionSpec):

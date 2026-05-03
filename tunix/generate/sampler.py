@@ -28,6 +28,7 @@ from flax.nnx import filterlib
 from flax.nnx import graph
 from flax.nnx import statelib
 import jax
+from jax.experimental import multihost_utils
 import jax.numpy as jnp
 import jaxtyping
 import numpy as np
@@ -39,6 +40,12 @@ from tunix.processors import image_processor as image_processor_lib
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
+
+
+def _device_get_array(value: Any) -> Any:
+  if isinstance(value, jax.Array) and not value.is_fully_addressable:
+    return multihost_utils.process_allgather(value, tiled=True)
+  return jax.device_get(value)
 
 
 @flax.struct.dataclass
@@ -803,7 +810,8 @@ class Sampler(base_sampler.BaseSampler):
           max_prompt_length,
           max_len,
       )
-      out_tokens, lengths = jax.device_get(out_tokens), jax.device_get(lengths)
+      out_tokens = _device_get_array(out_tokens)
+      lengths = _device_get_array(lengths)
       decoded_outputs = [
           self.tokenizer.decode(tokens[:length].tolist())
           for tokens, length in zip(out_tokens, lengths)
@@ -835,7 +843,7 @@ class Sampler(base_sampler.BaseSampler):
         text=decoded_outputs,
         logits=out_logits if return_logits else [],
         tokens=out_tokens,
-        padded_prompt_tokens=all_input_ids,
+        padded_prompt_tokens=_device_get_array(all_input_ids),
         logprobs=None,
     )
     return result
