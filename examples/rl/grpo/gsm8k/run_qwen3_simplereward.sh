@@ -19,6 +19,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 HF_TOKEN_ENV_FILE="${HF_TOKEN_ENV_FILE:-$HOME/.cache/tunix/hf_token_env}"
+DATE_TIME_STR="${DATE_TIME_STR:-$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_LOG_DIR="${RUN_LOG_DIR:-/home/gs1693/repo/tunix/examples/rl/grpo/logs/${DATE_TIME_STR}_qwen3_simplereward}"
+mkdir -p "$RUN_LOG_DIR"
+
+if [[ -n "${TPU_WORKER_MODE:-}" ]]; then
+    RUN_LOG_ROLE="worker"
+else
+    RUN_LOG_ROLE="launcher"
+fi
+RUN_LOG_HOST="$(hostname)"
+RUN_LOG_STEM="${RUN_LOG_STEM:-qwen3_simplereward_${DATE_TIME_STR}}"
+RUN_LOG_FILE="${RUN_LOG_FILE:-$RUN_LOG_DIR/${RUN_LOG_STEM}_${RUN_LOG_ROLE}_${RUN_LOG_HOST}.log}"
+
+mkdir -p "$RUN_LOG_DIR"
+exec > >(tee -a "$RUN_LOG_FILE") 2>&1
+echo "Logging to $RUN_LOG_FILE"
 
 # Prefer the wrapper-created env file so HF_TOKEN does not need to be embedded
 # in the gcloud SSH command line.
@@ -37,7 +53,7 @@ if [[ -z "${TPU_WORKER_MODE:-}" ]]; then
 
     # Pass through any user-overridden params
     PASSTHROUGH="TPU_WORKER_MODE=1"
-    for var in HF_TOKEN_ENV_FILE model_name batch_size num_batches num_train_epochs warmup_ratio train_fraction rollout_mesh_shape rollout_tensor_parallel_size rollout_data_parallel_size TUNIX_VLLM_USE_LOCAL_TPU_DEVICE_IDS; do
+    for var in HF_TOKEN_ENV_FILE model_name batch_size num_batches num_train_epochs warmup_ratio train_fraction rollout_mesh_shape rollout_tensor_parallel_size rollout_data_parallel_size TUNIX_VLLM_USE_LOCAL_TPU_DEVICE_IDS RUN_LOG_DIR RUN_LOG_STEM; do
         if [[ -n "${!var:-}" ]]; then
             printf -v quoted_value "%q" "${!var}"
             PASSTHROUGH="$PASSTHROUGH $var=$quoted_value"
@@ -80,8 +96,8 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
   exit 1
 fi
 
-mkdir -p ~/tpu_logs
-export TPU_LOG_DIR=~/tpu_logs
+mkdir -p "$RUN_LOG_DIR"
+export TPU_LOG_DIR="$RUN_LOG_DIR"
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 cd "$REPO_ROOT"
 

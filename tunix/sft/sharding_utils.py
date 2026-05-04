@@ -40,23 +40,28 @@ def shard_input(
     return input_data
 
   pspec = shd.PartitionSpec(*data_sharding_axis)
-  # Check if the input is already sharded with the target mesh to avoid
-  # re-sharding.
-  is_sharded = jax.tree.map(
-      lambda x: isinstance(x, jax.Array)
-      and hasattr(x, "sharding")
-      and hasattr(x.sharding, "mesh")
-      and x.sharding.mesh == mesh
-      and hasattr(x.sharding, "spec")
-      and x.sharding.spec == pspec,
-      input_data,
-  )
-  if all(jax.tree.leaves(is_sharded)):
-    return input_data
+
+  def has_target_sharding(x):
+    if not isinstance(x, jax.Array):
+      return True
+    target_sharding = get_sharding(x, mesh=mesh, pspec=pspec)
+    return x.sharding == target_sharding
 
   def shard_leaf(x):
+    if not isinstance(x, (np.ndarray, jax.Array)):
+      return x
     sharding = get_sharding(x, mesh=mesh, pspec=pspec)
-    return jax.device_put(x, sharding)
+    if isinstance(x, jax.Array):
+      if x.sharding == sharding:
+        return x
+      if not x.is_fully_addressable:
+        return jax.lax.with_sharding_constraint(x, sharding)
+      x = jax.device_get(x)
+
+    return jax.make_array_from_process_local_data(sharding, x)
+
+  if all(jax.tree.leaves(jax.tree.map(has_target_sharding, input_data))):
+    return input_data
 
   with jax.transfer_guard("allow"):
     return jax.tree.map(shard_leaf, input_data)
@@ -75,10 +80,16 @@ def get_sharding(x: jax.Array, mesh: shd.Mesh, pspec: shd.PartitionSpec):
   # Check for divisibility for all sharded axes.
   for i, axis_name in enumerate(pspec):
     if axis_name is not None:
+      dim_size = x.shape[i]
+      if (
+          jax.process_count() > 1
+          and (not isinstance(x, jax.Array) or x.is_fully_addressable)
+      ):
+        dim_size *= jax.process_count()
       axis_names = axis_name if isinstance(axis_name, tuple) else (axis_name,)
       for name in axis_names:
         axis_size = mesh.shape[name]
-        if x.shape[i] % axis_size != 0:
+        if dim_size % axis_size != 0:
           # Replicate if not evenly divisible.
           return shd.NamedSharding(mesh, shd.PartitionSpec())
   return shd.NamedSharding(mesh, pspec)

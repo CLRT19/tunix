@@ -47,7 +47,7 @@ if [[ -z "${TPU_WORKER_MODE:-}" ]]; then
     ZONE=$(echo "$TPU_ENV" | grep "^ZONE:" | awk '{print $2}' | tr -d "'")
 
     PASSTHROUGH="TPU_WORKER_MODE=1"
-    for var in HF_TOKEN_ENV_FILE model_name SMOKE_LOG_DIR SMOKE_LOG_STEM SMOKE_MESH_SHAPE SMOKE_MESH_AXIS_NAMES; do
+    for var in HF_TOKEN_ENV_FILE model_name SMOKE_LOG_DIR SMOKE_LOG_STEM SMOKE_MESH_SHAPE SMOKE_MESH_AXIS_NAMES SMOKE_BATCH_SIZE SMOKE_NUM_BATCHES SMOKE_NUM_TRAIN_EPOCHS SMOKE_TRAIN_FRACTION SMOKE_MAX_STEPS SMOKE_NUM_GENERATIONS SMOKE_TOTAL_GENERATION_STEPS SMOKE_MAX_PROMPT_LENGTH SMOKE_NUM_TEST_BATCHES; do
         if [[ -n "${!var:-}" ]]; then
             printf -v quoted_value "%q" "${!var}"
             PASSTHROUGH="$PASSTHROUGH $var=$quoted_value"
@@ -97,21 +97,32 @@ cd "$REPO_ROOT"
 model_name=${model_name:-"Qwen3-1.7B-base"}
 mesh_shape=${SMOKE_MESH_SHAPE:-"(8,4)"}
 mesh_axis_names=${SMOKE_MESH_AXIS_NAMES:-"('fsdp','tp')"}
-batch_size=8
-num_batches=1
-num_train_epochs=1
+batch_size=${SMOKE_BATCH_SIZE:-8}
+num_batches=${SMOKE_NUM_BATCHES:-1}
+num_train_epochs=${SMOKE_NUM_TRAIN_EPOCHS:-1}
 warmup_ratio=0.0
-train_fraction=0.25  # max_steps = 8 * 1 * 1 * 0.25 = 2
+train_fraction=${SMOKE_TRAIN_FRACTION:-0.25}  # default max_steps = 8 * 1 * 1 * 0.25 = 2
+num_test_batches=${SMOKE_NUM_TEST_BATCHES:-2}
+num_generations=${SMOKE_NUM_GENERATIONS:-4}
+total_generation_steps=${SMOKE_TOTAL_GENERATION_STEPS:-128}
+max_prompt_length=${SMOKE_MAX_PROMPT_LENGTH:-256}
 
 echo "[smoke] Using parameters:"
 echo "  Model: $model_name"
 echo "  Batch Size: $batch_size"
 echo "  Num Batches: $num_batches"
 echo "  Train Fraction: $train_fraction"
+echo "  Num Generations: $num_generations"
+echo "  Generation Steps: $total_generation_steps"
+echo "  Max Prompt Length: $max_prompt_length"
 echo "  Mesh: $mesh_shape $mesh_axis_names"
 
-max_steps_float=$(awk "BEGIN {print $batch_size * $num_batches * $num_train_epochs * $train_fraction}")
-max_steps=$(printf "%.0f" "$max_steps_float")
+if [[ -n "${SMOKE_MAX_STEPS:-}" ]]; then
+  max_steps="$SMOKE_MAX_STEPS"
+else
+  max_steps_float=$(awk "BEGIN {print $batch_size * $num_batches * $num_train_epochs * $train_fraction}")
+  max_steps=$(printf "%.0f" "$max_steps_float")
+fi
 warmup_steps=0
 
 echo "  Max steps: $max_steps"
@@ -143,8 +154,12 @@ fi
   dataset_name="gsm8k" \
   batch_size=$batch_size \
   num_batches=$num_batches \
-  num_test_batches=2 \
+  num_test_batches=$num_test_batches \
   num_train_epochs=$num_train_epochs \
+  rl_training_config.mini_batch_size=$batch_size \
+  rl_training_config.train_micro_batch_size=$batch_size \
+  rl_training_config.rollout_micro_batch_size=$batch_size \
+  rl_training_config.compute_logps_micro_batch_size=$batch_size \
   rl_training_config.actor_optimizer_config.opt_type="adamw" \
   rl_training_config.actor_optimizer_config.peak_value=3e-6 \
   rl_training_config.actor_optimizer_config.schedule_type="warmup_cosine_decay_schedule" \
@@ -164,14 +179,14 @@ fi
   rl_training_config.checkpointing_options.save_interval_steps=1000 \
   rl_training_config.checkpointing_options.max_to_keep=1 \
   rl_training_config.profiler_options={} \
-  rollout_config.total_generation_steps=128 \
-  rollout_config.max_prompt_length=256 \
+  rollout_config.total_generation_steps=$total_generation_steps \
+  rollout_config.max_prompt_length=$max_prompt_length \
   rollout_config.temperature=0.9 \
   rollout_config.top_p=1.0 \
   rollout_config.top_k=50 \
   rollout_engine="vanilla" \
   offload_to_cpu=false \
-  grpo_config.num_generations=4 \
+  grpo_config.num_generations=$num_generations \
   grpo_config.num_iterations=1 \
   grpo_config.beta=0.08 \
   grpo_config.epsilon=0.2 \

@@ -520,16 +520,54 @@ class RLLearner(abc.ABC, Generic[TConfig]):
     first_item = next(full_batch_iterator)
     full_batch_size = len(first_item["prompts"])
     full_batch_iterator = itertools.chain([first_item], full_batch_iterator)
-    # Initialize batch sizes.
-    mini_batch_size = self._training_config.mini_batch_size or full_batch_size
-    train_micro_batch_size = (
-        self._training_config.train_micro_batch_size or mini_batch_size
+    process_count = jax.process_count()
+    global_full_batch_size = full_batch_size * process_count
+
+    def to_local_batch_size(
+        value: int | None, default_global_value: int, name: str
+    ) -> tuple[int, int]:
+      global_value = value or default_global_value
+      if process_count > 1 and global_value % process_count != 0:
+        raise ValueError(
+            f"Global {name} must be divisible by jax.process_count(). Got"
+            f" {name}={global_value}, process_count={process_count}."
+        )
+      local_value = global_value // process_count
+      if local_value < 1:
+        raise ValueError(
+            f"Local {name} must be at least 1. Got global {name}="
+            f"{global_value}, process_count={process_count}."
+        )
+      return local_value, global_value
+
+    # User-facing RL batch sizes are global. The train loop below works on each
+    # process's local shard.
+    mini_batch_size, global_mini_batch_size = to_local_batch_size(
+        self._training_config.mini_batch_size,
+        global_full_batch_size,
+        "mini_batch_size",
     )
-    self._rollout_micro_batch_size = (
-        self._rollout_micro_batch_size or train_micro_batch_size
+    train_micro_batch_size, global_train_micro_batch_size = (
+        to_local_batch_size(
+            self._training_config.train_micro_batch_size,
+            global_mini_batch_size,
+            "train_micro_batch_size",
+        )
     )
-    self._compute_logps_micro_batch_size = (
-        self._compute_logps_micro_batch_size or train_micro_batch_size
+    self._rollout_micro_batch_size, global_rollout_micro_batch_size = (
+        to_local_batch_size(
+            self._rollout_micro_batch_size,
+            global_train_micro_batch_size,
+            "rollout_micro_batch_size",
+        )
+    )
+    (
+        self._compute_logps_micro_batch_size,
+        global_compute_logps_micro_batch_size,
+    ) = to_local_batch_size(
+        self._compute_logps_micro_batch_size,
+        global_train_micro_batch_size,
+        "compute_logps_micro_batch_size",
     )
     for v, n in [
         (self._rollout_micro_batch_size, f"{self._rollout_micro_batch_size=}"),
@@ -545,7 +583,14 @@ class RLLearner(abc.ABC, Generic[TConfig]):
     )
 
     logging.info(  # pylint: disable=logging-fstring-interpolation
-        f"Training with {full_batch_size=}, {mini_batch_size=},"
+        f"Training with process_index={jax.process_index()},"
+        f" process_count={process_count}, local {full_batch_size=},"
+        f" global_full_batch_size={global_full_batch_size},"
+        f" global_mini_batch_size={global_mini_batch_size},"
+        f" global_train_micro_batch_size={global_train_micro_batch_size},"
+        f" global_rollout_micro_batch_size={global_rollout_micro_batch_size},"
+        " global_compute_logps_micro_batch_size="
+        f"{global_compute_logps_micro_batch_size}, local {mini_batch_size=},"
         f" {train_micro_batch_size=}, {self._rollout_micro_batch_size=},"
         f" {self._compute_logps_micro_batch_size=}, {grad_acc_steps=}"
     )

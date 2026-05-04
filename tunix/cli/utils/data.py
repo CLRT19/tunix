@@ -6,6 +6,8 @@ import importlib
 import os
 from typing import Any, Callable, Optional, Union
 
+from absl import logging
+import jax
 from tunix.generate import tokenizer_adapter
 
 Tokenizer = tokenizer_adapter.Tokenizer
@@ -142,6 +144,8 @@ def post_init_dataset(
     num_epochs: int = 1,
     prompt_key: str = "prompts",
     custom_batch_fn: Optional[Callable] = None,
+    shard_by_process: bool = False,
+    batch_size_is_global: bool = False,
 ):
   """Applies post-initialization transformations to a dataset.
 
@@ -158,9 +162,26 @@ def post_init_dataset(
     fraction: Fraction of the dataset to use (between 0.0 and 1.0), commonly
       used for splitting training and validation sets.
     num_epochs: Number of times to repeat the dataset.
+    shard_by_process: Whether to give each JAX process a disjoint shard of the
+      dataset before batching.
+    batch_size_is_global: Whether `batch_size` is the global batch size across
+      all JAX processes. When true, each process batches
+      `batch_size // jax.process_count()` examples.
   Returns:
     The processed dataset.
   """
+  process_count = jax.process_count() if shard_by_process else 1
+  process_index = jax.process_index() if shard_by_process else 0
+  local_batch_size = batch_size
+  if batch_size_is_global and process_count > 1:
+    if batch_size % process_count != 0:
+      raise ValueError(
+          "Global batch_size must be divisible by jax.process_count() when"
+          f" sharding the dataset. Got batch_size={batch_size},"
+          f" process_count={process_count}."
+      )
+    local_batch_size = batch_size // process_count
+
   if max_prompt_length is not None and max_prompt_length > 0:
 
     def prompt_length_filter(x):
@@ -181,16 +202,54 @@ def post_init_dataset(
     first_segment_dataset = dataset
     second_segment_dataset = None
 
+  def process_shard(dataset_segment):
+    if not shard_by_process:
+      return dataset_segment
+    segment_size = len(dataset_segment)
+    shardable_size = segment_size - (segment_size % process_count)
+    local_size = shardable_size // process_count
+    if local_size == 0:
+      raise ValueError(
+          "Dataset segment is too small to shard across JAX processes. Got"
+          f" segment_size={segment_size}, process_count={process_count}."
+      )
+    local_start = process_index * local_size
+    local_end = local_start + local_size
+    if shardable_size != segment_size:
+      logging.warning(
+          "Dropping %d dataset examples so %d examples can be evenly sharded"
+          " across %d JAX processes.",
+          segment_size - shardable_size,
+          shardable_size,
+          process_count,
+      )
+    return dataset_segment[local_start:local_end]
+
+  first_segment_dataset = process_shard(first_segment_dataset)
+  if second_segment_dataset is not None:
+    second_segment_dataset = process_shard(second_segment_dataset)
+
+  if shard_by_process:
+    logging.info(
+        "Prepared process-local dataset shard: process=%d/%d,"
+        " global_batch_size=%d, local_batch_size=%d, local_examples=%d.",
+        process_index,
+        process_count,
+        batch_size,
+        local_batch_size,
+        len(first_segment_dataset),
+    )
+
   first_segment_dataset = (
       first_segment_dataset.repeat(num_epochs)
       .to_iter_dataset()
-      .batch(batch_size, batch_fn=custom_batch_fn)
+      .batch(local_batch_size, batch_fn=custom_batch_fn)
   )
   if second_segment_dataset is not None:
     second_segment_dataset = (
         second_segment_dataset.repeat(num_epochs)
         .to_iter_dataset()
-        .batch(batch_size, batch_fn=custom_batch_fn)
+        .batch(local_batch_size, batch_fn=custom_batch_fn)
     )
 
   return first_segment_dataset, second_segment_dataset

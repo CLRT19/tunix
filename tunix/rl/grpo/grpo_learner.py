@@ -36,6 +36,35 @@ RewardFn = rl_learner.RewardFn
 MetricFn = rl_learner.MetricFn
 
 
+def _process_local_array(value):
+  """Returns this process's addressable slice without cross-host all-gather."""
+  if value is None:
+    return None
+  if isinstance(value, jax.Array) and not value.is_fully_addressable:
+    local_shards = value.addressable_shards
+    if not local_shards:
+      raise ValueError("No addressable shards are available on this process.")
+
+    def shard_key(shard):
+      key = []
+      for idx in shard.index:
+        if isinstance(idx, slice):
+          key.append((idx.start or 0, idx.stop or -1, idx.step or 1))
+        else:
+          key.append(idx)
+      return tuple(key)
+
+    unique_shards = {}
+    for shard in sorted(local_shards, key=shard_key):
+      unique_shards.setdefault(shard_key(shard), jax.device_get(shard.data))
+
+    shard_values = list(unique_shards.values())
+    if len(shard_values) == 1:
+      return shard_values[0]
+    return np.concatenate(shard_values, axis=0)
+  return jax.device_get(value)
+
+
 @flax.struct.dataclass(frozen=True)
 class TrainExample(common.TrainExample):
   pass
@@ -223,6 +252,28 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
             self._rollout_micro_batch_size * self.algo_config.num_generations
         ),
     )
+    local_batch_size = len(training_input["prompts"])
+    if len(rollout_output.text) != local_batch_size:
+      raise ValueError(
+          "Rollout returned a different number of local completions than local"
+          f" prompts on process {jax.process_index()}. Got"
+          f" completions={len(rollout_output.text)},"
+          f" prompts={local_batch_size}."
+      )
+    if len(rollout_output.tokens) != local_batch_size:
+      raise ValueError(
+          "Rollout returned a different number of local token rows than local"
+          f" prompts on process {jax.process_index()}. Got"
+          f" token_rows={len(rollout_output.tokens)},"
+          f" prompts={local_batch_size}."
+      )
+    if rollout_output.left_padded_prompt_tokens.shape[0] != local_batch_size:
+      raise ValueError(
+          "Rollout returned a different number of local padded prompts than"
+          f" local prompts on process {jax.process_index()}. Got"
+          f" padded_prompts={rollout_output.left_padded_prompt_tokens.shape[0]},"
+          f" prompts={local_batch_size}."
+      )
     padded_completion_ids = np.array([
         utils.pad_to_length(
             completion_ids,
@@ -284,12 +335,31 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
           mode=mode,
           **{k: v for k, v in training_input.items() if k != "prompts"},
       )
+      if rewards.shape[0] != local_batch_size:
+        raise ValueError(
+            "Reward function returned a different number of local rewards than"
+            f" completions on process {jax.process_index()}. Got"
+            f" rewards={rewards.shape[0]}, completions={local_batch_size}."
+        )
+      if rewards.shape[0] % self.algo_config.num_generations != 0:
+        raise ValueError(
+            "Local reward count must be divisible by num_generations. Got"
+            f" rewards={rewards.shape[0]},"
+            f" num_generations={self.algo_config.num_generations}."
+        )
       advantage_estimator = function_registry.get_advantage_estimator(
           self.algo_config.advantage_estimator
       )
       advantages = advantage_estimator(
           rewards=rewards, num_generations=self.algo_config.num_generations
       )
+      if advantages.shape[0] != local_batch_size:
+        raise ValueError(
+            "Advantage estimator returned a different number of local"
+            f" advantages than completions on process {jax.process_index()}."
+            f" Got advantages={advantages.shape[0]},"
+            f" completions={local_batch_size}."
+        )
 
     # Log raw scores from the reward model fn
     self.rl_cluster.buffer_metrics(
@@ -332,14 +402,25 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
       )
       self.rl_cluster.buffer_metrics(user_defined_metric, mode=mode)
 
+    local_ref_per_token_logps = (
+        None
+        if ref_per_token_logps is None
+        else jnp.asarray(_process_local_array(ref_per_token_logps))
+    )
+    local_old_per_token_logps = (
+        None
+        if old_per_token_logps is None
+        else jnp.asarray(_process_local_array(old_per_token_logps))
+    )
+
     return TrainExample(
         prompt_ids=prompt_ids,
         prompt_mask=prompt_mask,
         completion_ids=jax_completion_ids,
         completion_mask=jax_completion_mask,
-        ref_per_token_logps=ref_per_token_logps,
-        advantages=jax.device_put(advantages),
-        old_per_token_logps=old_per_token_logps,
+        ref_per_token_logps=local_ref_per_token_logps,
+        advantages=jnp.asarray(advantages),
+        old_per_token_logps=local_old_per_token_logps,
     )
 
   def _compute_trajectory_ids(

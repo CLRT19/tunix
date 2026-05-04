@@ -227,6 +227,8 @@ class GrpoPipeline(config.HyperParameters):
         max_prompt_length=self.config["rollout_config"].get(
             "max_prompt_length", None
         ),
+        shard_by_process=jax.process_count() > 1,
+        batch_size_is_global=True,
     )
     grpo_trainer.train(dataset)
 

@@ -18,7 +18,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SCRIPT="$SCRIPT_DIR/run_qwen3_simplereward.sh"
 PREFLIGHT_SCRIPT="$SCRIPT_DIR/jax_tpu_preflight.py"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+SAMPLER="$REPO_ROOT/tunix/generate/sampler.py"
 VLLM_SAMPLER="$REPO_ROOT/tunix/generate/vllm_sampler.py"
+SHARDING_UTILS="$REPO_ROOT/tunix/sft/sharding_utils.py"
+RL_LEARNER="$REPO_ROOT/tunix/rl/rl_learner.py"
+RL_CLUSTER="$REPO_ROOT/tunix/rl/rl_cluster.py"
+GRPO_LEARNER="$REPO_ROOT/tunix/rl/grpo/grpo_learner.py"
+GRPO_MAIN="$REPO_ROOT/tunix/cli/grpo_main.py"
+DATA_UTILS="$REPO_ROOT/tunix/cli/utils/data.py"
 REMOTE_TOKEN_ENV="$HOME/.cache/tunix/hf_token_env"
 CLEAN_STALE_TPU_STATE="${CLEAN_STALE_TPU_STATE:-1}"
 CHECK_TPU_VFIO_BUSY="${CHECK_TPU_VFIO_BUSY:-1}"
@@ -46,6 +53,18 @@ if [[ ! -f "$VLLM_SAMPLER" ]]; then
   echo "vLLM sampler not found: $VLLM_SAMPLER" >&2
   exit 1
 fi
+
+if [[ ! -f "$SHARDING_UTILS" ]]; then
+  echo "Sharding utils not found: $SHARDING_UTILS" >&2
+  exit 1
+fi
+
+for required_file in "$SAMPLER" "$RL_LEARNER" "$RL_CLUSTER" "$GRPO_LEARNER" "$GRPO_MAIN" "$DATA_UTILS"; do
+  if [[ ! -f "$required_file" ]]; then
+    echo "Required Tunix source file not found: $required_file" >&2
+    exit 1
+  fi
+done
 
 TPU_ENV=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/attributes/tpu-env" \
   -H "Metadata-Flavor: Google")
@@ -91,7 +110,35 @@ gcloud compute tpus tpu-vm scp "$PREFLIGHT_SCRIPT" "$TPU_NAME:$PREFLIGHT_SCRIPT"
   --zone="$ZONE" \
   --worker=all
 
+gcloud compute tpus tpu-vm scp "$SAMPLER" "$TPU_NAME:$SAMPLER" \
+  --zone="$ZONE" \
+  --worker=all
+
 gcloud compute tpus tpu-vm scp "$VLLM_SAMPLER" "$TPU_NAME:$VLLM_SAMPLER" \
+  --zone="$ZONE" \
+  --worker=all
+
+gcloud compute tpus tpu-vm scp "$SHARDING_UTILS" "$TPU_NAME:$SHARDING_UTILS" \
+  --zone="$ZONE" \
+  --worker=all
+
+gcloud compute tpus tpu-vm scp "$RL_LEARNER" "$TPU_NAME:$RL_LEARNER" \
+  --zone="$ZONE" \
+  --worker=all
+
+gcloud compute tpus tpu-vm scp "$RL_CLUSTER" "$TPU_NAME:$RL_CLUSTER" \
+  --zone="$ZONE" \
+  --worker=all
+
+gcloud compute tpus tpu-vm scp "$GRPO_LEARNER" "$TPU_NAME:$GRPO_LEARNER" \
+  --zone="$ZONE" \
+  --worker=all
+
+gcloud compute tpus tpu-vm scp "$GRPO_MAIN" "$TPU_NAME:$GRPO_MAIN" \
+  --zone="$ZONE" \
+  --worker=all
+
+gcloud compute tpus tpu-vm scp "$DATA_UTILS" "$TPU_NAME:$DATA_UTILS" \
   --zone="$ZONE" \
   --worker=all
 

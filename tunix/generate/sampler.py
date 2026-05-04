@@ -29,6 +29,7 @@ from flax.nnx import graph
 from flax.nnx import statelib
 import jax
 from jax.experimental import multihost_utils
+from jax.interpreters import pxla
 import jax.numpy as jnp
 import jaxtyping
 import numpy as np
@@ -37,14 +38,36 @@ from tunix.generate import utils
 import tunix.generate.beam_search as beam_search_lib
 import tunix.generate.tokenizer_adapter as tok_adapter
 from tunix.processors import image_processor as image_processor_lib
+from tunix.sft import sharding_utils
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
 
 
-def _device_get_array(value: Any) -> Any:
+def _process_local_array(value: Any) -> Any:
+  """Returns this process's addressable slice without cross-host all-gather."""
   if isinstance(value, jax.Array) and not value.is_fully_addressable:
-    return multihost_utils.process_allgather(value, tiled=True)
+    local_shards = value.addressable_shards
+    if not local_shards:
+      raise ValueError("No addressable shards are available on this process.")
+
+    def shard_key(shard):
+      key = []
+      for idx in shard.index:
+        if isinstance(idx, slice):
+          key.append((idx.start or 0, idx.stop or -1, idx.step or 1))
+        else:
+          key.append(idx)
+      return tuple(key)
+
+    unique_shards = {}
+    for shard in sorted(local_shards, key=shard_key):
+      unique_shards.setdefault(shard_key(shard), jax.device_get(shard.data))
+
+    shard_values = list(unique_shards.values())
+    if len(shard_values) == 1:
+      return shard_values[0]
+    return np.concatenate(shard_values, axis=0)
   return jax.device_get(value)
 
 
@@ -739,6 +762,11 @@ class Sampler(base_sampler.BaseSampler):
       processed_images = jnp.array(processed_images)
 
     max_tokens_length = max(len(x) for x in tokens)
+    if jax.process_count() > 1:
+      all_max_tokens_length = multihost_utils.process_allgather(
+          np.array(max_tokens_length, dtype=np.int32)
+      )
+      max_tokens_length = int(np.max(np.asarray(all_max_tokens_length)))
     if max_prompt_length is None or max_prompt_length < max_tokens_length:
       max_prompt_length = utils.next_power_of_2(max_tokens_length)
 
@@ -763,6 +791,8 @@ class Sampler(base_sampler.BaseSampler):
       seed = jax.random.PRNGKey(0)
     elif isinstance(seed, int):
       seed = jax.random.PRNGKey(seed)
+    if jax.process_count() > 1:
+      seed = jax.random.fold_in(seed, jax.process_index())
     sampling_state = self.init_sample_state(
         jnp.array(all_input_ids),
         include_logits=return_logits,
@@ -774,6 +804,10 @@ class Sampler(base_sampler.BaseSampler):
         seed=seed,
         beam_size=beam_size,
     )
+    mesh = pxla.thread_resources.env.physical_mesh
+    if not mesh.empty and "fsdp" in mesh.shape:
+      sampling_state = sharding_utils.shard_input(sampling_state, ("fsdp",))
+      sampling_state = dataclasses.replace(sampling_state, seed=seed)
     sampling_state = self._compiled_prefill_fn(
         self._flattened_transformer_state,
         sampling_state,
@@ -810,8 +844,9 @@ class Sampler(base_sampler.BaseSampler):
           max_prompt_length,
           max_len,
       )
-      out_tokens = _device_get_array(out_tokens)
-      lengths = _device_get_array(lengths)
+      out_tokens = _process_local_array(out_tokens)
+      lengths = _process_local_array(lengths)
+      out_logits = _process_local_array(out_logits) if return_logits else None
       decoded_outputs = [
           self.tokenizer.decode(tokens[:length].tolist())
           for tokens, length in zip(out_tokens, lengths)
@@ -819,6 +854,10 @@ class Sampler(base_sampler.BaseSampler):
     else:
       out_tokens = []
       out_logits = []
+      token_buffers = _process_local_array(token_buffers)
+      logits_buffers = (
+          _process_local_array(logits_buffers) if return_logits else None
+      )
       for i, token_buffer in enumerate(token_buffers):
         start_idx = (
             utils.find_first_non_pad_idx(token_buffer, self.tokenizer.pad_id())
@@ -843,7 +882,7 @@ class Sampler(base_sampler.BaseSampler):
         text=decoded_outputs,
         logits=out_logits if return_logits else [],
         tokens=out_tokens,
-        padded_prompt_tokens=_device_get_array(all_input_ids),
+        padded_prompt_tokens=np.asarray(all_input_ids),
         logprobs=None,
     )
     return result

@@ -1007,14 +1007,22 @@ class RLCluster:
       self._maybe_load_model_from_cpu(model, Role.ROLLOUT)
       if self.cluster_config.offload_to_cpu:
         self.rollout.update_params(nnx.state(model))
+      dest_prompt_tokens = sharding_utils.shard_input(
+          prompt_tokens,
+          self.cluster_config.training_config.data_sharding_axis,
+      )
+      dest_completion_tokens = sharding_utils.shard_input(
+          completion_tokens,
+          self.cluster_config.training_config.data_sharding_axis,
+      )
       outs = []
       for batch_slice in rl_utils.chunk_slices_by_size(
           stop=batch_size, step=micro_batch_size
       ):
         outs.append(
             self.rollout.get_per_token_logps(
-                prompt_tokens[batch_slice],
-                completion_tokens[batch_slice],
+                dest_prompt_tokens[batch_slice],
+                dest_completion_tokens[batch_slice],
                 completion_mask=None
                 if completion_mask is None
                 else completion_mask[batch_slice],
