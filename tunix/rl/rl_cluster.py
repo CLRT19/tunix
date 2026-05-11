@@ -95,6 +95,10 @@ class RLTrainingConfig(peft_trainer.TrainingConfig):
     train_micro_batch_size: The micro-batch size used for gradient accumulation
       at training time. `train_micro_batch_size` must be divisible by
       `mini_batch_size`.
+    actor_train_completion_micro_batch_size: Optional local completion batch
+      size for actor training. If set, each materialized actor TrainExample is
+      split into completion chunks of this size after rollout, reward,
+      advantage, reference-logp, and old-logp computation.
     rollout_micro_batch_size: The micro-batch size used for model rollouts.
     compute_logps_micro_batch_size: The micro-batch size used for computing log
       probabilities (e.g. for reference and old policy models).
@@ -104,6 +108,7 @@ class RLTrainingConfig(peft_trainer.TrainingConfig):
   critic_optimizer: optax.GradientTransformation | None = None
   mini_batch_size: int | None = None
   train_micro_batch_size: int | None = None
+  actor_train_completion_micro_batch_size: int | None = None
   rollout_micro_batch_size: int | None = None
   compute_logps_micro_batch_size: int | None = None
 
@@ -112,6 +117,7 @@ class RLTrainingConfig(peft_trainer.TrainingConfig):
     for name in [
         "mini_batch_size",
         "train_micro_batch_size",
+        "actor_train_completion_micro_batch_size",
         "rollout_micro_batch_size",
         "compute_logps_micro_batch_size",
     ]:

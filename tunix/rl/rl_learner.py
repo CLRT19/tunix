@@ -736,6 +736,30 @@ class RLLearner(abc.ABC, Generic[TConfig]):
         mode=rl_cluster_lib.Mode.TRAIN,
     )
 
+    def maybe_split_actor_examples(
+        examples: list[common.TrainExample],
+    ) -> list[common.TrainExample | common.TrainExampleMicroBatch]:
+      chunk_size = (
+          self._training_config.actor_train_completion_micro_batch_size
+      )
+      if chunk_size is None:
+        return examples
+      loss_agg_mode = getattr(self.algo_config, "loss_agg_mode", "token-mean")
+      split_examples = []
+      for example in examples:
+        chunks = common.split_train_example(
+            example,
+            chunk_size=chunk_size,
+            loss_agg_mode=loss_agg_mode,
+        )
+        if len(chunks) == 1:
+          split_examples.append(chunks[0])
+        else:
+          split_examples.append(
+              common.TrainExampleMicroBatch(chunks=tuple(chunks))
+          )
+      return split_examples
+
     curr_eval_ds = None
     with jax.profiler.StepTraceAnnotation("trainer", step_num=initial_steps):
       while True:
@@ -775,9 +799,15 @@ class RLLearner(abc.ABC, Generic[TConfig]):
               mode=rl_cluster_lib.Mode.EVAL,
           )
           curr_eval_ds = eval_data_queue.get(block=True)
+        actor_train_ds = maybe_split_actor_examples(curr_train_ds)
+        actor_eval_ds = (
+            maybe_split_actor_examples(curr_eval_ds)
+            if curr_eval_ds is not None
+            else None
+        )
         self.rl_cluster.update_actor(
-            curr_train_ds,
-            curr_eval_ds,
+            actor_train_ds,
+            actor_eval_ds,
             skip_jit,
         )  # loop over μ num_iterations
         if hasattr(self.rl_cluster, "critic_trainer"):

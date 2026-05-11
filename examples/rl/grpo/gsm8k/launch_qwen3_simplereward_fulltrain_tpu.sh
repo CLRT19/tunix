@@ -14,6 +14,7 @@
 #
 # Overrides:
 #   batch_size=32 mini_batch_size=32 train_micro_batch_size=8 \
+#     actor_train_completion_micro_batch_size=1 \
 #     num_generations=4 total_generation_steps=8096 max_steps=4000 \
 #     bash launch_qwen3_simplereward_fulltrain_tpu.sh
 #
@@ -34,6 +35,8 @@ SAMPLER="$REPO_ROOT/tunix/generate/sampler.py"
 VANILLA_ROLLOUT="$REPO_ROOT/tunix/rl/rollout/vanilla_rollout.py"
 VLLM_SAMPLER="$REPO_ROOT/tunix/generate/vllm_sampler.py"
 SHARDING_UTILS="$REPO_ROOT/tunix/sft/sharding_utils.py"
+RL_COMMON="$REPO_ROOT/tunix/rl/common.py"
+RL_TRAINER="$REPO_ROOT/tunix/rl/trainer.py"
 RL_LEARNER="$REPO_ROOT/tunix/rl/rl_learner.py"
 RL_CLUSTER="$REPO_ROOT/tunix/rl/rl_cluster.py"
 GRPO_LEARNER="$REPO_ROOT/tunix/rl/grpo/grpo_learner.py"
@@ -48,6 +51,10 @@ CHECK_TPU_VFIO_BUSY="${CHECK_TPU_VFIO_BUSY:-1}"
 RUN_TPU_PREFLIGHT="${RUN_TPU_PREFLIGHT:-1}"
 TPU_PREFLIGHT_TIMEOUT_SECONDS="${TPU_PREFLIGHT_TIMEOUT_SECONDS:-180}"
 TPU_PREFLIGHT_HOLD_SECONDS="${TPU_PREFLIGHT_HOLD_SECONDS:-30}"
+num_generations="${num_generations:-4}"
+if [[ "$num_generations" == "4" ]]; then
+  actor_train_completion_micro_batch_size="${actor_train_completion_micro_batch_size:-1}"
+fi
 
 if [[ -z "${HF_TOKEN:-}" ]]; then
   echo "HF_TOKEN must be set before launching." >&2
@@ -55,7 +62,7 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
   exit 1
 fi
 
-for required_file in "$TRAIN_SCRIPT" "$PREFLIGHT_SCRIPT" "$MOUNT_SCRIPT" "$SAMPLER" "$VANILLA_ROLLOUT" "$VLLM_SAMPLER" "$SHARDING_UTILS" "$RL_LEARNER" "$RL_CLUSTER" "$GRPO_LEARNER" "$PEFT_TRAINER" "$GRPO_MAIN" "$CLI_CONFIG" "$DATA_UTILS" "$MATH_DATASET"; do
+for required_file in "$TRAIN_SCRIPT" "$PREFLIGHT_SCRIPT" "$MOUNT_SCRIPT" "$SAMPLER" "$VANILLA_ROLLOUT" "$VLLM_SAMPLER" "$SHARDING_UTILS" "$RL_COMMON" "$RL_TRAINER" "$RL_LEARNER" "$RL_CLUSTER" "$GRPO_LEARNER" "$PEFT_TRAINER" "$GRPO_MAIN" "$CLI_CONFIG" "$DATA_UTILS" "$MATH_DATASET"; do
   if [[ ! -f "$required_file" ]]; then
     echo "Required file not found: $required_file" >&2
     exit 1
@@ -98,7 +105,7 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
   --worker=all \
   --command="chmod 600 '$REMOTE_TOKEN_ENV'"
 
-for file_to_sync in "$TRAIN_SCRIPT" "$PREFLIGHT_SCRIPT" "$MOUNT_SCRIPT" "$SAMPLER" "$VANILLA_ROLLOUT" "$VLLM_SAMPLER" "$SHARDING_UTILS" "$RL_LEARNER" "$RL_CLUSTER" "$GRPO_LEARNER" "$PEFT_TRAINER" "$GRPO_MAIN" "$CLI_CONFIG" "$DATA_UTILS" "$MATH_DATASET"; do
+for file_to_sync in "$TRAIN_SCRIPT" "$PREFLIGHT_SCRIPT" "$MOUNT_SCRIPT" "$SAMPLER" "$VANILLA_ROLLOUT" "$VLLM_SAMPLER" "$SHARDING_UTILS" "$RL_COMMON" "$RL_TRAINER" "$RL_LEARNER" "$RL_CLUSTER" "$GRPO_LEARNER" "$PEFT_TRAINER" "$GRPO_MAIN" "$CLI_CONFIG" "$DATA_UTILS" "$MATH_DATASET"; do
   gcloud compute tpus tpu-vm scp "$file_to_sync" "$TPU_NAME:$file_to_sync" \
     --zone="$ZONE" \
     --worker=all
@@ -168,4 +175,7 @@ fi
 
 echo "[fulltrain] Launching full fine-tuning run"
 cd "$REPO_ROOT"
-HF_TOKEN_ENV_FILE="$REMOTE_TOKEN_ENV" bash "$TRAIN_SCRIPT"
+HF_TOKEN_ENV_FILE="$REMOTE_TOKEN_ENV" \
+  num_generations="$num_generations" \
+  actor_train_completion_micro_batch_size="${actor_train_completion_micro_batch_size:-}" \
+  bash "$TRAIN_SCRIPT"

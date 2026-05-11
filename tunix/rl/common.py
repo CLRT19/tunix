@@ -13,6 +13,7 @@
 # limitations under the License.
 """Common RL helper classes and functions."""
 
+import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
 from typing import Any, Iterable
 
@@ -103,6 +104,68 @@ class TrainExample:
   advantages: jax.Array
   ref_per_token_logps: jax.Array | None
   old_per_token_logps: jax.Array | None
+  loss_scale: jax.Array | float = dataclasses.field(
+      default=1.0, kw_only=True
+  )
+
+
+@flax.struct.dataclass(frozen=True)
+class TrainExampleMicroBatch:
+  chunks: tuple[TrainExample, ...]
+
+
+def split_train_example(
+    example: TrainExample,
+    chunk_size: int,
+    loss_agg_mode: str = "token-mean",
+) -> list[TrainExample]:
+  """Splits a TrainExample along the completion batch axis.
+
+  The returned chunks keep per-example fields aligned and carry a `loss_scale`
+  that makes summing chunk gradients equivalent to differentiating the original
+  example under the configured loss aggregation mode.
+
+  Args:
+    example: Full train example to split.
+    chunk_size: Maximum number of completion rows in each chunk.
+    loss_agg_mode: Loss aggregation mode used by the actor loss.
+
+  Returns:
+    A list of TrainExample chunks.
+  """
+  if chunk_size <= 0:
+    raise ValueError(f"chunk_size must be positive. Got: {chunk_size}")
+
+  batch_size = example.completion_ids.shape[0]
+  if chunk_size >= batch_size:
+    return [example.replace(loss_scale=jnp.asarray(1.0, dtype=jnp.float32))]
+
+  total_tokens = jnp.clip(example.completion_mask.sum(), min=1)
+  chunks = []
+  for start in range(0, batch_size, chunk_size):
+    end = min(start + chunk_size, batch_size)
+    row_slice = slice(start, end)
+
+    def slice_leaf(x):
+      if x is None:
+        return None
+      if (
+          isinstance(x, (jax.Array, np.ndarray))
+          and x.ndim > 0
+          and x.shape[0] == batch_size
+      ):
+        return x[row_slice]
+      return x
+
+    chunk = jax.tree.map(slice_leaf, example)
+    if loss_agg_mode == "token-mean":
+      loss_scale = chunk.completion_mask.sum() / total_tokens
+    else:
+      loss_scale = (end - start) / batch_size
+    chunks.append(
+        chunk.replace(loss_scale=jnp.asarray(loss_scale, dtype=jnp.float32))
+    )
+  return chunks
 
 
 def compute_kl_divergence(

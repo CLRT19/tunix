@@ -371,6 +371,90 @@ class CommonTest(parameterized.TestCase):
     self.assertEqual(loss.dtype, jnp.float32)
     self.assertAlmostEqual(loss, 1.5, places=5)
 
+  def test_split_train_example_reconstructs_batch_fields(self):
+    example = common.TrainExample(
+        prompt_ids=jnp.arange(12).reshape(4, 3),
+        prompt_mask=jnp.ones((4, 3), dtype=jnp.int32),
+        completion_ids=jnp.arange(20).reshape(4, 5),
+        completion_mask=jnp.array([
+            [1, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0],
+            [1, 1, 1, 0, 0],
+            [1, 0, 0, 0, 0],
+        ]),
+        advantages=jnp.array([0.5, -0.2, 1.0, -1.5]),
+        ref_per_token_logps=jnp.arange(20).reshape(4, 5) / 10.0,
+        old_per_token_logps=None,
+    )
+
+    chunks = common.split_train_example(
+        example, chunk_size=1, loss_agg_mode="token-mean"
+    )
+
+    self.assertLen(chunks, 4)
+    for field_name in (
+        "prompt_ids",
+        "prompt_mask",
+        "completion_ids",
+        "completion_mask",
+        "advantages",
+        "ref_per_token_logps",
+    ):
+      reconstructed = jnp.concatenate(
+          [getattr(chunk, field_name) for chunk in chunks], axis=0
+      )
+      np.testing.assert_array_equal(reconstructed, getattr(example, field_name))
+    self.assertIsNone(chunks[0].old_per_token_logps)
+    np.testing.assert_allclose(
+        jnp.array([chunk.loss_scale for chunk in chunks]),
+        jnp.array([1 / 7, 2 / 7, 3 / 7, 1 / 7]),
+    )
+
+  @parameterized.named_parameters(
+      ("token_mean", "token-mean"),
+      ("sequence_mean_token_mean", "sequence-mean-token-mean"),
+  )
+  def test_split_train_example_loss_scales_match_full_loss(
+      self, loss_agg_mode
+  ):
+    completion_mask = jnp.array([
+        [1, 0, 0],
+        [1, 1, 0],
+        [1, 1, 1],
+        [1, 0, 0],
+    ])
+    per_token_loss = jnp.array([
+        [1.0, 0.0, 0.0],
+        [2.0, 4.0, 0.0],
+        [1.0, 3.0, 5.0],
+        [7.0, 0.0, 0.0],
+    ])
+    example = common.TrainExample(
+        prompt_ids=jnp.ones((4, 2), dtype=jnp.int32),
+        prompt_mask=jnp.ones((4, 2), dtype=jnp.int32),
+        completion_ids=jnp.ones((4, 3), dtype=jnp.int32),
+        completion_mask=completion_mask,
+        advantages=jnp.arange(4, dtype=jnp.float32),
+        ref_per_token_logps=None,
+        old_per_token_logps=None,
+    )
+
+    chunks = common.split_train_example(
+        example, chunk_size=1, loss_agg_mode=loss_agg_mode
+    )
+    full_loss = common.aggregate_loss(
+        per_token_loss, completion_mask, loss_agg_mode
+    )
+    chunked_loss = 0.0
+    for i, chunk in enumerate(chunks):
+      chunked_loss += chunk.loss_scale * common.aggregate_loss(
+          per_token_loss[i : i + 1],
+          chunk.completion_mask,
+          loss_agg_mode,
+      )
+
+    np.testing.assert_allclose(chunked_loss, full_loss, rtol=1e-6, atol=1e-6)
+
 
 if __name__ == "__main__":
   absltest.main()

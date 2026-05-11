@@ -401,7 +401,10 @@ class PeftTrainer:
     train_step = self.create_train_step_fn()
     eval_step = self.create_eval_step_fn()
     if skip_jit:
-      return train_step, eval_step
+      return (
+          functools.partial(train_step, self.model, self.optimizer),
+          functools.partial(eval_step, self.model),
+      )
 
     if self._jitted_train_step_fn is None:
       self._shard_optimizer(pxla.thread_resources.env.physical_mesh)
@@ -428,6 +431,26 @@ class PeftTrainer:
   def _prepare_inputs(self, input_data: Any) -> Any:
     """Override this function for additional input preparation."""
     return input_data
+
+  def _call_train_step(
+      self,
+      train_step_fn: Callable[[Any], Tuple[ArrayLike, Any | None, ArrayLike]],
+      train_example: Any,
+  ) -> Tuple[ArrayLike, Any | None, ArrayLike]:
+    """Calls one train step.
+
+    Subclasses can override this when one logical training example needs to be
+    executed through multiple compiled calls.
+    """
+    return train_step_fn(train_example)
+
+  def _call_eval_step(
+      self,
+      eval_step_fn: Callable[[Any], Tuple[ArrayLike, Any | None]],
+      eval_example: Any,
+  ) -> Tuple[ArrayLike, Any | None]:
+    """Calls one eval step."""
+    return eval_step_fn(eval_example)
 
   def _post_process_train_step(self, aux: Any) -> None:
     """Override this function for post processing aux data from train step."""
@@ -692,7 +715,9 @@ class PeftTrainer:
             pxla.thread_resources.env.physical_mesh.devices,
             tags=tags,
         ) as span_v2:
-          train_loss, aux, grad_norm = train_step(train_example)
+          train_loss, aux, grad_norm = self._call_train_step(
+              train_step, train_example
+          )
           span.device_end([train_loss])
           span_v2.async_end([train_loss])
 
@@ -817,7 +842,7 @@ class PeftTrainer:
         )
         if self.training_hooks:
           self.training_hooks.on_eval_step_start(self)
-        loss, aux = eval_step_fn(eval_example)
+        loss, aux = self._call_eval_step(eval_step_fn, eval_example)
         loss = jax.lax.stop_gradient(loss)
         self._buffered_eval_metrics = self._buffer_metrics(
             self._buffered_eval_metrics,

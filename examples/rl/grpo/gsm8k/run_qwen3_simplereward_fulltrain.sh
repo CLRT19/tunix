@@ -40,7 +40,7 @@ if [[ -z "${TPU_WORKER_MODE:-}" ]]; then
   ZONE=$(echo "$TPU_ENV" | grep "^ZONE:" | awk '{print $2}' | tr -d "'")
 
   PASSTHROUGH="TPU_WORKER_MODE=1"
-  for var in HF_TOKEN_ENV_FILE DATE_TIME_STR RUN_LOG_DIR RUN_LOG_STEM BUCKET_NAME BUCKET_MOUNT_POINT BUCKET_RUN_ROOT CHECKPOINT_ROOT TENSORBOARD_LOG_DIR TRAJECTORY_LOG_DIR TUNIX_JAX_DISTRIBUTED_AUTO_INIT TUNIX_JAX_DISTRIBUTED_INIT_TIMEOUT_SECONDS TUNIX_SKIP_FINAL_CHECKPOINT TUNIX_DISABLE_SAMPLER_STATE_SHARDING TUNIX_SAMPLER_DEBUG_SHARDS model_name batch_size mini_batch_size train_micro_batch_size rollout_micro_batch_size compute_logps_micro_batch_size num_batches num_train_epochs warmup_ratio max_steps model_mesh_shape model_mesh_axis_names rollout_engine rollout_mesh_shape rollout_tensor_parallel_size rollout_data_parallel_size TUNIX_VLLM_USE_LOCAL_TPU_DEVICE_IDS total_generation_steps max_prompt_length num_generations rollout_vllm_max_num_seqs rollout_vllm_max_num_batched_tokens rollout_temperature rollout_top_p rollout_top_k num_test_batches eval_every_n_steps metrics_flush_every_n_steps save_interval_steps max_to_keep trajectory_max_rows_per_step; do
+  for var in HF_TOKEN_ENV_FILE DATE_TIME_STR RUN_LOG_DIR RUN_LOG_STEM BUCKET_NAME BUCKET_MOUNT_POINT BUCKET_RUN_ROOT CHECKPOINT_ROOT TENSORBOARD_LOG_DIR TRAJECTORY_LOG_DIR TUNIX_JAX_DISTRIBUTED_AUTO_INIT TUNIX_JAX_DISTRIBUTED_INIT_TIMEOUT_SECONDS TUNIX_SKIP_FINAL_CHECKPOINT TUNIX_DISABLE_SAMPLER_STATE_SHARDING TUNIX_SAMPLER_DEBUG_SHARDS model_name batch_size mini_batch_size train_micro_batch_size actor_train_completion_micro_batch_size rollout_micro_batch_size compute_logps_micro_batch_size num_batches num_train_epochs warmup_ratio max_steps model_mesh_shape model_mesh_axis_names rollout_engine rollout_mesh_shape rollout_tensor_parallel_size rollout_data_parallel_size TUNIX_VLLM_USE_LOCAL_TPU_DEVICE_IDS total_generation_steps max_prompt_length num_generations rollout_vllm_max_num_seqs rollout_vllm_max_num_batched_tokens rollout_temperature rollout_top_p rollout_top_k num_test_batches eval_every_n_steps metrics_flush_every_n_steps save_interval_steps max_to_keep trajectory_max_rows_per_step; do
     if [[ -v "$var" ]]; then
       printf -v quoted_value "%q" "${!var}"
       PASSTHROUGH="$PASSTHROUGH $var=$quoted_value"
@@ -112,6 +112,7 @@ model_name=${model_name:-"Qwen3-1.7B-base"}
 batch_size=${batch_size:-32}
 mini_batch_size=${mini_batch_size:-$batch_size}
 train_micro_batch_size=${train_micro_batch_size:-8}
+actor_train_completion_micro_batch_size=${actor_train_completion_micro_batch_size:-1}
 rollout_micro_batch_size=${rollout_micro_batch_size:-$train_micro_batch_size}
 compute_logps_micro_batch_size=${compute_logps_micro_batch_size:-$train_micro_batch_size}
 num_batches=${num_batches:-4000}
@@ -152,6 +153,13 @@ else
 fi
 
 warmup_steps=$(awk "BEGIN {printf \"%.0f\", $warmup_ratio * $max_steps}")
+
+actor_train_args=()
+if [[ -n "$actor_train_completion_micro_batch_size" ]]; then
+  actor_train_args+=(
+    rl_training_config.actor_train_completion_micro_batch_size="$actor_train_completion_micro_batch_size"
+  )
+fi
 rollout_sampling_args=(rollout_config.temperature="$rollout_temperature")
 if [[ -n "$rollout_top_p" ]]; then
   rollout_sampling_args+=(rollout_config.top_p="$rollout_top_p")
@@ -165,6 +173,7 @@ echo "  Model: $model_name"
 echo "  Global Prompt Batch Size/Data Step: $batch_size"
 echo "  Global PPO Mini Batch Size: $mini_batch_size"
 echo "  Global Train/Rollout/Logps Micro Batch Sizes: $train_micro_batch_size/$rollout_micro_batch_size/$compute_logps_micro_batch_size"
+echo "  Local Actor Completion Micro Batch Size: ${actor_train_completion_micro_batch_size:-disabled}"
 echo "  Num Generations: $num_generations"
 echo "  Effective PPO Mini Batch Completions: $((mini_batch_size * num_generations))"
 echo "  Global Rollout Batch Completions/Data Step: $((batch_size * num_generations))"
@@ -224,6 +233,7 @@ fi
   num_train_epochs=$num_train_epochs \
   rl_training_config.mini_batch_size=$mini_batch_size \
   rl_training_config.train_micro_batch_size=$train_micro_batch_size \
+  "${actor_train_args[@]}" \
   rl_training_config.rollout_micro_batch_size=$rollout_micro_batch_size \
   rl_training_config.compute_logps_micro_batch_size=$compute_logps_micro_batch_size \
   rl_training_config.actor_optimizer_config.opt_type="adamw" \
