@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 import dataclasses
+import os
 from typing import Any, Optional
 import warnings
 
@@ -69,6 +70,19 @@ def _process_local_array(value: Any) -> Any:
       return shard_values[0]
     return np.concatenate(shard_values, axis=0)
   return jax.device_get(value)
+
+
+def _process_sampler_output_array(
+    value: Any, *, gather_non_addressable: bool = False
+) -> Any:
+  """Returns sampler outputs, optionally reconstructing global sharded arrays."""
+  if (
+      gather_non_addressable
+      and isinstance(value, jax.Array)
+      and not value.is_fully_addressable
+  ):
+    return multihost_utils.process_allgather(value, tiled=True)
+  return _process_local_array(value)
 
 
 @flax.struct.dataclass
@@ -805,14 +819,112 @@ class Sampler(base_sampler.BaseSampler):
         beam_size=beam_size,
     )
     mesh = pxla.thread_resources.env.physical_mesh
-    if not mesh.empty and "fsdp" in mesh.shape:
+    disable_sampler_state_sharding = os.environ.get(
+        "TUNIX_DISABLE_SAMPLER_STATE_SHARDING", ""
+    ).lower() in ("1", "true", "yes", "on")
+
+    debug_shards = os.environ.get(
+        "TUNIX_SAMPLER_DEBUG_SHARDS", ""
+    ).lower() in ("1", "true", "yes", "on")
+    if debug_shards:
+      try:
+        local_first_row_tail = np.asarray(
+            jnp.asarray(all_input_ids)[0, -24:]
+        ).tolist()
+      except Exception as exc:  # pragma: no cover - debug only
+        local_first_row_tail = f"<error: {exc!r}>"
+      print(
+          f"SAMPLER_DEBUG_LOCAL proc={jax.process_index()}/"
+          f"{jax.process_count()} all_input_ids.shape="
+          f"{tuple(np.asarray(all_input_ids).shape)} "
+          f"local_first_row_tail24={local_first_row_tail}",
+          flush=True,
+      )
+
+    if (
+        not disable_sampler_state_sharding
+        and not mesh.empty
+        and "fsdp" in mesh.shape
+    ):
       sampling_state = sharding_utils.shard_input(sampling_state, ("fsdp",))
       sampling_state = dataclasses.replace(sampling_state, seed=seed)
+
+    if debug_shards:
+      tb = sampling_state.token_buffer
+      try:
+        is_global = isinstance(tb, jax.Array) and not tb.is_fully_addressable
+        addressable = []
+        if isinstance(tb, jax.Array) and is_global:
+          # Each addressable shard's first-row last-24-token slice, with the
+          # global-batch index range of that shard so we can tell which shard
+          # this process actually owns post-shard_input.
+          for s in tb.addressable_shards:
+            data = np.asarray(s.data)
+            addressable.append({
+                "index": str(s.index),
+                "shape": tuple(data.shape),
+                "first_row_tail24": data[0, -24:].tolist()
+                if data.ndim >= 2
+                else data[-24:].tolist(),
+            })
+          tb_repr = (
+              f"global_shape={tuple(tb.shape)} sharding={tb.sharding!r}"
+              f" addressable_shards={addressable}"
+          )
+        else:
+          arr = np.asarray(tb)
+          tb_repr = (
+              f"shape={tuple(arr.shape)} fully_addressable=True"
+              f" first_row_tail24={arr[0, -24:].tolist() if arr.ndim >= 2 else arr[-24:].tolist()}"
+          )
+      except Exception as exc:  # pragma: no cover - debug only
+        tb_repr = f"<error: {exc!r}>"
+      print(
+          f"SAMPLER_DEBUG_POST_SHARD proc={jax.process_index()}/"
+          f"{jax.process_count()} disable_sampler_state_sharding="
+          f"{disable_sampler_state_sharding} mesh.shape={dict(mesh.shape)} "
+          f"token_buffer_{tb_repr}",
+          flush=True,
+      )
     sampling_state = self._compiled_prefill_fn(
         self._flattened_transformer_state,
         sampling_state,
         processed_images,
     )
+
+    if debug_shards:
+      tb = sampling_state.token_buffer
+      try:
+        if isinstance(tb, jax.Array) and not tb.is_fully_addressable:
+          shard_info = []
+          for s in tb.addressable_shards:
+            data = np.asarray(s.data)
+            shard_info.append({
+                "index": str(s.index),
+                "shape": tuple(data.shape),
+                "first_row_first_post_prompt_24": (
+                    data[0, max_prompt_length:max_prompt_length + 24].tolist()
+                    if data.ndim >= 2
+                    and data.shape[1] > max_prompt_length
+                    else None
+                ),
+            })
+          post_repr = (
+              f"global_shape={tuple(tb.shape)} addressable_shards={shard_info}"
+          )
+        else:
+          arr = np.asarray(tb)
+          post_repr = (
+              f"shape={tuple(arr.shape)} first_row_first_post_prompt_24="
+              f"{arr[0, max_prompt_length:max_prompt_length+24].tolist() if arr.ndim >= 2 and arr.shape[1] > max_prompt_length else None}"
+          )
+      except Exception as exc:  # pragma: no cover - debug only
+        post_repr = f"<error: {exc!r}>"
+      print(
+          f"SAMPLER_DEBUG_POST_PREFILL proc={jax.process_index()}/"
+          f"{jax.process_count()} token_buffer_{post_repr}",
+          flush=True,
+      )
 
     sampling_state = self._compiled_decode_fn(
         self._flattened_transformer_state, sampling_state
@@ -844,9 +956,22 @@ class Sampler(base_sampler.BaseSampler):
           max_prompt_length,
           max_len,
       )
-      out_tokens = _process_local_array(out_tokens)
-      lengths = _process_local_array(lengths)
-      out_logits = _process_local_array(out_logits) if return_logits else None
+      out_tokens = _process_sampler_output_array(
+          out_tokens,
+          gather_non_addressable=disable_sampler_state_sharding,
+      )
+      lengths = _process_sampler_output_array(
+          lengths,
+          gather_non_addressable=disable_sampler_state_sharding,
+      )
+      out_logits = (
+          _process_sampler_output_array(
+              out_logits,
+              gather_non_addressable=disable_sampler_state_sharding,
+          )
+          if return_logits
+          else None
+      )
       decoded_outputs = [
           self.tokenizer.decode(tokens[:length].tolist())
           for tokens, length in zip(out_tokens, lengths)
@@ -854,9 +979,17 @@ class Sampler(base_sampler.BaseSampler):
     else:
       out_tokens = []
       out_logits = []
-      token_buffers = _process_local_array(token_buffers)
+      token_buffers = _process_sampler_output_array(
+          token_buffers,
+          gather_non_addressable=disable_sampler_state_sharding,
+      )
       logits_buffers = (
-          _process_local_array(logits_buffers) if return_logits else None
+          _process_sampler_output_array(
+              logits_buffers,
+              gather_non_addressable=disable_sampler_state_sharding,
+          )
+          if return_logits
+          else None
       )
       for i, token_buffer in enumerate(token_buffers):
         start_idx = (

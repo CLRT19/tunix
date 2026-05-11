@@ -615,11 +615,28 @@ class HyperParameters:
           f"Mesh shape {axis_shapes} requires {np.prod(axis_shapes)} devices, "
           f"but found {num_devices}."
       )
-    return jax.make_mesh(
-        tuple(axis_shapes),
-        tuple(axis_names),
-        axis_types=(jax.sharding.AxisType.Auto,) * len(tuple(axis_names)),
+    # NOTE: We deliberately avoid `jax.make_mesh` here. On multi-host TPU
+    # pods `jax.make_mesh` calls `mesh_utils.create_device_mesh`, which
+    # reorders devices to optimize torus topology. That reordering can
+    # spread a single JAX process's local devices across multiple shards
+    # of the leading axis (e.g. fsdp), which silently halves the global
+    # batch dimension built by `make_array_from_process_local_data` and
+    # causes pairs of processes to share a data-parallel shard. Instead,
+    # use a row-major reshape of `jax.devices()` so each process owns
+    # exactly one slice of the leading axis. This matches the layout the
+    # multi-host debug harness uses and is what
+    # `tunix/sft/sharding_utils.shard_input` assumes.
+    if int(np.prod(axis_shapes)) != num_devices:
+      raise ValueError(
+          f"Mesh shape {axis_shapes} (product {int(np.prod(axis_shapes))})"
+          f" does not match the full device count {num_devices}. Provide"
+          " a mesh that covers every device so the row-major device"
+          " reshape is unambiguous."
+      )
+    devices = np.asarray(jax.devices(), dtype=object).reshape(
+        tuple(axis_shapes)
     )
+    return jax.sharding.Mesh(devices, tuple(axis_names))
 
   def obtain_training_config_dict(self, key):
     """Obtain training config dictionary from specified key in self.config.

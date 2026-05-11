@@ -20,8 +20,10 @@ import tensorflow_datasets as tfds
 # For OSS usage
 import tensorflow_datasets.text.gsm8k
 
-reasoning_start = "<reasoning>"
-reasoning_end = "</reasoning>"
+# reasoning_start = "<reasoning>"
+# reasoning_end = "</reasoning>"
+reasoning_start = "<think>"
+reasoning_end = "</think>"
 solution_start = "<answer>"
 solution_end = "</answer>"
 

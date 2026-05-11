@@ -18,6 +18,7 @@ from collections.abc import Iterable
 import contextlib
 import dataclasses
 import functools
+import os
 import time
 from typing import Any, Callable, Concatenate, Dict, List, ParamSpec, Tuple
 
@@ -742,6 +743,16 @@ class PeftTrainer:
       self.close()
 
   def _save_last_checkpoint(self):
+    if os.environ.get("TUNIX_SKIP_FINAL_CHECKPOINT", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+      logging.info(
+          "Skipping close-time final checkpoint because"
+          " TUNIX_SKIP_FINAL_CHECKPOINT is set."
+      )
+      return
     last_saved_step = self.checkpoint_manager.latest_step()
     if last_saved_step is None or last_saved_step < self._train_steps:
       self.checkpoint_manager.save(

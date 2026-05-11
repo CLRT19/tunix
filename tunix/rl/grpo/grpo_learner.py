@@ -36,6 +36,59 @@ RewardFn = rl_learner.RewardFn
 MetricFn = rl_learner.MetricFn
 
 
+def _first_token_index(token_ids: np.ndarray, token_value: int) -> int:
+  matches = np.where(token_ids == token_value)[0]
+  if matches.size == 0:
+    return -1
+  return int(matches[0])
+
+
+def _completion_token_debug_metrics(
+    token_rows: Sequence[np.ndarray],
+    tokenizer,
+    pad_id: int,
+    eos_id: int,
+) -> dict[str, tuple[object, object]]:
+  """Builds per-completion token debug metrics for trajectory CSV logging."""
+  token_id_strings = []
+  token_counts = []
+  nonpad_counts = []
+  first_eos_indices = []
+  decoded_from_token_ids = []
+
+  for token_row in token_rows:
+    token_ids = np.asarray(token_row, dtype=np.int64).reshape(-1)
+    first_pad_index = _first_token_index(token_ids, pad_id)
+    first_eos_index = _first_token_index(token_ids, eos_id)
+    trim_index = first_pad_index if first_pad_index >= 0 else token_ids.size
+    trimmed_token_ids = token_ids[:trim_index]
+
+    token_id_strings.append(",".join(str(int(x)) for x in token_ids))
+    token_counts.append(int(token_ids.size))
+    nonpad_counts.append(int(np.sum(token_ids != pad_id)))
+    first_eos_indices.append(first_eos_index)
+    decoded_from_token_ids.append(tokenizer.decode(trimmed_token_ids.tolist()))
+
+  return {
+      "completions/token_ids": (token_id_strings, None),
+      "completions/token_count": (np.asarray(token_counts), np.mean),
+      "completions/nonpad_count": (np.asarray(nonpad_counts), np.mean),
+      "completions/first_eos_index": (
+          np.asarray(first_eos_indices),
+          np.mean,
+      ),
+      "completions/pad_id": (
+          np.full((len(token_rows),), pad_id, dtype=np.int64),
+          np.mean,
+      ),
+      "completions/eos_id": (
+          np.full((len(token_rows),), eos_id, dtype=np.int64),
+          np.mean,
+      ),
+      "completions/decoded_from_token_ids": (decoded_from_token_ids, None),
+  }
+
+
 def _process_local_array(value):
   """Returns this process's addressable slice without cross-host all-gather."""
   if value is None:
@@ -292,6 +345,16 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
     # Convert completion_ids and completion_mask to jax arrays
     jax_completion_ids = jnp.array(padded_completion_ids)
     jax_completion_mask = jnp.array(completion_mask)
+
+    self.rl_cluster.buffer_metrics(
+        _completion_token_debug_metrics(
+            padded_completion_ids,
+            self.rl_cluster.tokenizer,
+            pad_value,
+            eos_value,
+        ),
+        mode=mode,
+    )
 
     if self.algo_config.beta != 0.0:
       devices = self.rl_cluster.r2m[rl_cluster_lib.Role.REFERENCE].devices

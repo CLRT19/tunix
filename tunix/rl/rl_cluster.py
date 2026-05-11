@@ -957,14 +957,6 @@ class RLCluster:
     with self._get_mesh_and_logical_axis_rules_cm(Role.REFERENCE):
       # This assumes reference model shards same data sharding as actor, which
       # should be true as ref model and policy model shares same architecture.
-      dest_prompt_tokens = sharding_utils.shard_input(
-          prompt_tokens,
-          self.cluster_config.training_config.data_sharding_axis,
-      )
-      dest_completion_tokens = sharding_utils.shard_input(
-          completion_tokens,
-          self.cluster_config.training_config.data_sharding_axis,
-      )
       self._maybe_load_model_from_cpu(
           self.inference_worker.get_model("reference"), Role.REFERENCE
       )
@@ -972,15 +964,29 @@ class RLCluster:
       for batch_slice in rl_utils.chunk_slices_by_size(
           stop=batch_size, step=micro_batch_size
       ):
+        dest_prompt_tokens = sharding_utils.shard_input(
+            prompt_tokens[batch_slice],
+            self.cluster_config.training_config.data_sharding_axis,
+        )
+        dest_completion_tokens = sharding_utils.shard_input(
+            completion_tokens[batch_slice],
+            self.cluster_config.training_config.data_sharding_axis,
+        )
+        dest_completion_mask = (
+            None
+            if completion_mask is None
+            else sharding_utils.shard_input(
+                completion_mask[batch_slice],
+                self.cluster_config.training_config.data_sharding_axis,
+            )
+        )
         outs.append(
             self.inference_worker.get_ref_per_token_logps(
-                dest_prompt_tokens[batch_slice],
-                dest_completion_tokens[batch_slice],
+                dest_prompt_tokens,
+                dest_completion_tokens,
                 pad_id,
                 eos_id,
-                completion_mask=None
-                if completion_mask is None
-                else completion_mask[batch_slice],
+                completion_mask=dest_completion_mask,
             )
         )
       ref_per_token_logps = jnp.concatenate(outs, axis=0)
@@ -1007,25 +1013,31 @@ class RLCluster:
       self._maybe_load_model_from_cpu(model, Role.ROLLOUT)
       if self.cluster_config.offload_to_cpu:
         self.rollout.update_params(nnx.state(model))
-      dest_prompt_tokens = sharding_utils.shard_input(
-          prompt_tokens,
-          self.cluster_config.training_config.data_sharding_axis,
-      )
-      dest_completion_tokens = sharding_utils.shard_input(
-          completion_tokens,
-          self.cluster_config.training_config.data_sharding_axis,
-      )
       outs = []
       for batch_slice in rl_utils.chunk_slices_by_size(
           stop=batch_size, step=micro_batch_size
       ):
+        dest_prompt_tokens = sharding_utils.shard_input(
+            prompt_tokens[batch_slice],
+            self.cluster_config.training_config.data_sharding_axis,
+        )
+        dest_completion_tokens = sharding_utils.shard_input(
+            completion_tokens[batch_slice],
+            self.cluster_config.training_config.data_sharding_axis,
+        )
+        dest_completion_mask = (
+            None
+            if completion_mask is None
+            else sharding_utils.shard_input(
+                completion_mask[batch_slice],
+                self.cluster_config.training_config.data_sharding_axis,
+            )
+        )
         outs.append(
             self.rollout.get_per_token_logps(
-                dest_prompt_tokens[batch_slice],
-                dest_completion_tokens[batch_slice],
-                completion_mask=None
-                if completion_mask is None
-                else completion_mask[batch_slice],
+                dest_prompt_tokens,
+                dest_completion_tokens,
+                completion_mask=dest_completion_mask,
             )
         )
       per_token_logps = jnp.concatenate(outs, axis=0)

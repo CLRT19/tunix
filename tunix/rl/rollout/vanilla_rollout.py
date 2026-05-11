@@ -51,14 +51,19 @@ class VanillaRollout(base_rollout.BaseRollout):
       **kwargs,
   ) -> base_rollout.RolloutOutput:
     """Generates samples from the model."""
+    top_p = rollout_config.top_p
+    top_k = rollout_config.top_k
+    if rollout_config.temperature == 0.0:
+      top_p = None
+      top_k = None
     output = self._sampler(
         input_strings=prompts,
         max_generation_steps=rollout_config.max_tokens_to_generate,
         max_prompt_length=rollout_config.max_prompt_length,
         echo=False,
         temperature=rollout_config.temperature,
-        top_p=rollout_config.top_p,
-        top_k=rollout_config.top_k,
+        top_p=top_p,
+        top_k=top_k,
         seed=rollout_config.seed,
         pad_output=True,
         eos_tokens=rollout_config.eos_tokens,

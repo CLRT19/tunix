@@ -14,13 +14,18 @@
 
 """Main entry point for GRPO training."""
 
+import csv
 import dataclasses
+import os
+import pathlib
+
 from absl import app
 from absl import flags
 from absl import logging
 from flax import nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from tunix.cli import config
 from tunix.cli.utils import data as data_lib
 from tunix.cli.utils import model as model_lib
@@ -37,6 +42,164 @@ GrpoConfig = grpo_learner.GrpoConfig
 _PATHWAYS_BNS = flags.DEFINE_string(
     "pathways_bns", None, "BNS address of the Pathways server."
 )
+
+
+def _maybe_initialize_jax_distributed():
+  """Initializes JAX distributed runtime when direct TPU-VM launch requests it."""
+  if os.environ.get("TUNIX_JAX_DISTRIBUTED_AUTO_INIT", "").lower() not in (
+      "1",
+      "true",
+      "yes",
+  ):
+    return
+  if jax.distributed.is_initialized():
+    return
+  timeout_seconds = int(
+      os.environ.get("TUNIX_JAX_DISTRIBUTED_INIT_TIMEOUT_SECONDS", "300")
+  )
+  logging.info(
+      "Initializing JAX distributed runtime with automatic cluster detection."
+  )
+  jax.distributed.initialize(initialization_timeout=timeout_seconds)
+
+
+def _flatten_metric_values(value):
+  """Flattens buffered metric values without treating strings as iterables."""
+  if isinstance(value, (str, bytes, np.str_)):
+    return [value]
+  if isinstance(value, (list, tuple)):
+    flattened = []
+    for item in value:
+      flattened.extend(_flatten_metric_values(item))
+    return flattened
+  try:
+    array_value = np.asarray(value)
+  except Exception:  # pylint: disable=broad-exception-caught
+    return [value]
+  if array_value.ndim == 0:
+    return [array_value.item()]
+  return array_value.reshape(-1).tolist()
+
+
+def _metric_values(metrics, metric_name):
+  if metric_name not in metrics:
+    return []
+  values, _ = metrics[metric_name]
+  return _flatten_metric_values(values)
+
+
+def _value_at(values, index):
+  return values[index] if index < len(values) else ""
+
+
+def _create_trajectory_csv_logger(log_dir, max_rows_per_step):
+  """Creates a per-process CSV logger for GRPO prompt/completion samples."""
+  pathlib.Path(log_dir).mkdir(parents=True, exist_ok=True)
+  process_index = jax.process_index()
+  csv_path = pathlib.Path(log_dir) / (
+      f"grpo_trajectories_process_{process_index}.csv"
+  )
+  fieldnames = [
+      "global_step",
+      "mode",
+      "process_index",
+      "row",
+      "reward_sum",
+      "reward_mean",
+      "reward_min",
+      "reward_max",
+      "completion_token_ids",
+      "completion_token_count",
+      "completion_nonpad_count",
+      "completion_first_eos_index",
+      "pad_id",
+      "eos_id",
+      "decoded_from_logged_token_ids",
+      "prompt",
+      "completion",
+  ]
+
+  def logger(metrics_buffer):
+    metrics = metrics_buffer.metrics
+    prompts = _metric_values(metrics, "prompts")
+    completions = _metric_values(metrics, "completions")
+    reward_sum = _metric_values(metrics, "rewards/sum")
+    reward_mean = _metric_values(metrics, "rewards/mean")
+    reward_min = _metric_values(metrics, "rewards/min")
+    reward_max = _metric_values(metrics, "rewards/max")
+    completion_token_ids = _metric_values(metrics, "completions/token_ids")
+    completion_token_count = _metric_values(
+        metrics, "completions/token_count"
+    )
+    completion_nonpad_count = _metric_values(
+        metrics, "completions/nonpad_count"
+    )
+    completion_first_eos_index = _metric_values(
+        metrics, "completions/first_eos_index"
+    )
+    pad_id = _metric_values(metrics, "completions/pad_id")
+    eos_id = _metric_values(metrics, "completions/eos_id")
+    decoded_from_logged_token_ids = _metric_values(
+        metrics, "completions/decoded_from_token_ids"
+    )
+
+    row_count = max(
+        len(prompts),
+        len(completions),
+        len(reward_sum),
+        len(reward_mean),
+        len(reward_min),
+        len(reward_max),
+        len(completion_token_ids),
+        len(completion_token_count),
+        len(completion_nonpad_count),
+        len(completion_first_eos_index),
+        len(pad_id),
+        len(eos_id),
+        len(decoded_from_logged_token_ids),
+    )
+    if row_count == 0:
+      return
+    if max_rows_per_step > 0:
+      row_count = min(row_count, max_rows_per_step)
+
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with csv_path.open("a", newline="", encoding="utf-8") as csv_file:
+      writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+      if write_header:
+        writer.writeheader()
+      for row_index in range(row_count):
+        writer.writerow({
+            "global_step": metrics_buffer.global_steps,
+            "mode": metrics_buffer.mode,
+            "process_index": process_index,
+            "row": row_index,
+            "reward_sum": _value_at(reward_sum, row_index),
+            "reward_mean": _value_at(reward_mean, row_index),
+            "reward_min": _value_at(reward_min, row_index),
+            "reward_max": _value_at(reward_max, row_index),
+            "completion_token_ids": _value_at(
+                completion_token_ids, row_index
+            ),
+            "completion_token_count": _value_at(
+                completion_token_count, row_index
+            ),
+            "completion_nonpad_count": _value_at(
+                completion_nonpad_count, row_index
+            ),
+            "completion_first_eos_index": _value_at(
+                completion_first_eos_index, row_index
+            ),
+            "pad_id": _value_at(pad_id, row_index),
+            "eos_id": _value_at(eos_id, row_index),
+            "decoded_from_logged_token_ids": _value_at(
+                decoded_from_logged_token_ids, row_index
+            ),
+            "prompt": _value_at(prompts, row_index),
+            "completion": _value_at(completions, row_index),
+        })
+
+  return logger
 
 
 class GrpoPipeline(config.HyperParameters):
@@ -200,6 +363,21 @@ class GrpoPipeline(config.HyperParameters):
         reward_fns=self.obtain_reward_fn(),
         algo_config=GrpoConfig(**self.config["grpo_config"]),
     )
+    trajectory_log_dir = os.environ.get("TUNIX_GRPO_TRAJECTORY_LOG_DIR")
+    if trajectory_log_dir:
+      max_rows_per_step = int(
+          os.environ.get("TUNIX_GRPO_TRAJECTORY_MAX_ROWS_PER_STEP", "64")
+      )
+      grpo_trainer.rl_cluster.with_external_metrics_logger(
+          _create_trajectory_csv_logger(
+              trajectory_log_dir, max_rows_per_step
+          )
+      )
+      logging.info(
+          "Writing GRPO trajectory CSV samples to %s, max_rows_per_step=%d",
+          trajectory_log_dir,
+          max_rows_per_step,
+      )
 
     tokenizer = grpo_trainer.rl_cluster.tokenizer
     if self.config.get("data_module", None):
@@ -217,6 +395,7 @@ class GrpoPipeline(config.HyperParameters):
       dataset = example_data.create_dataset(
           data_source="tfds",
           dataset=self.config["dataset_name"],
+          tokenizer=tokenizer,
           tfds_download=self.config["tfds_download"],
       )
     dataset, _ = data_lib.post_init_dataset(
@@ -243,6 +422,8 @@ def _setup_jax_pathways(pathways_bns: str):
 def main(argv, **kwargs):
   if _PATHWAYS_BNS.value:
     _setup_jax_pathways(_PATHWAYS_BNS.value)
+  else:
+    _maybe_initialize_jax_distributed()
   pipeline = GrpoPipeline(argv, **kwargs)
   logging.info(
       "--- Launching GRPO pipeline with following config ---\n"
