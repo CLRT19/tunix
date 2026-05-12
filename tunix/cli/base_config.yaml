@@ -184,6 +184,11 @@ grpo_config:
   # stable updates.
   epsilon: 0.2
 
+  reasoning_start: "<think>"
+  reasoning_end: "</think>"
+  solution_start: "<answer>"
+  solution_end: "</answer>"
+
 
 ############################### Rollout Config ###############################
 rollout_config:

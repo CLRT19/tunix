@@ -21,22 +21,31 @@ from absl import logging
 # Define the expected signature with type hints
 ExpectedSignature = Callable[..., List[float]]
 
-reasoning_start = "<reasoning>"
-reasoning_end = "</reasoning>"
+reasoning_start = "<think>"
+reasoning_end = "</think>"
 solution_start = "<answer>"
 solution_end = "</answer>"
-match_format = re.compile(
-    rf"^[\s]{{0,}}"
-    rf"{reasoning_start}.+?{reasoning_end}.*?"
-    rf"{solution_start}(.+?){solution_end}"
-    rf"[\s]{{0,}}$",
-    flags=re.MULTILINE | re.DOTALL,
-)
 
 
 # All reward functions must have this signature.
 # range: [0, 3]
-def match_format_exactly(prompts, completions, **kwargs):
+def match_format_exactly(
+    prompts,
+    completions,
+    reasoning_start=reasoning_start,
+    reasoning_end=reasoning_end,
+    solution_start=solution_start,
+    solution_end=solution_end,
+    **kwargs,
+):
+  del prompts, kwargs
+  match_format = re.compile(
+      rf"^[\s]{{0,}}"
+      rf"{re.escape(reasoning_start)}.+?{re.escape(reasoning_end)}.*?"
+      rf"{re.escape(solution_start)}(.+?){re.escape(solution_end)}"
+      rf"[\s]{{0,}}$",
+      flags=re.MULTILINE | re.DOTALL,
+  )
   return [
       0 if match_format.search(response) is None else 3.0
       for response in completions
@@ -44,7 +53,16 @@ def match_format_exactly(prompts, completions, **kwargs):
 
 
 # range: [-2, 2] 
-def match_format_approximately(prompts, completions, **kwargs):
+def match_format_approximately(
+    prompts,
+    completions,
+    reasoning_start=reasoning_start,
+    reasoning_end=reasoning_end,
+    solution_start=solution_start,
+    solution_end=solution_end,
+    **kwargs,
+):
+  del prompts, kwargs
   scores = []
 
   for completion in completions:
@@ -61,7 +79,24 @@ def match_format_approximately(prompts, completions, **kwargs):
 
 
 # range: [-1, 3]
-def check_answer(prompts, completions, answer, **kwargs):
+def check_answer(
+    prompts,
+    completions,
+    answer,
+    reasoning_start=reasoning_start,
+    reasoning_end=reasoning_end,
+    solution_start=solution_start,
+    solution_end=solution_end,
+    **kwargs,
+):
+  del prompts, kwargs
+  match_format = re.compile(
+      rf"^[\s]{{0,}}"
+      rf"{re.escape(reasoning_start)}.+?{re.escape(reasoning_end)}.*?"
+      rf"{re.escape(solution_start)}(.+?){re.escape(solution_end)}"
+      rf"[\s]{{0,}}$",
+      flags=re.MULTILINE | re.DOTALL,
+  )
   responses = completions
 
   extracted_responses = [
@@ -99,9 +134,18 @@ def check_answer(prompts, completions, answer, **kwargs):
 
 
 # range: [0, 1.5]
-def check_numbers(prompts, completions, answer, **kwargs):
+def check_numbers(
+    prompts,
+    completions,
+    answer,
+    solution_start=solution_start,
+    solution_end=solution_end,
+    **kwargs,
+):
+  del prompts, kwargs
   match_numbers = re.compile(
-      rf"{solution_start}.*?([\d\.]{{1,}})", flags=re.MULTILINE | re.DOTALL
+      rf"{re.escape(solution_start)}.*?([\d\.]{{1,}})",
+      flags=re.MULTILINE | re.DOTALL,
   )
   responses = completions
   extracted_responses = [

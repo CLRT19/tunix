@@ -21,20 +21,30 @@ from absl import logging
 # Define the expected signature with type hints
 ExpectedSignature = Callable[..., List[float]]
 
-reasoning_start = "<reasoning>"
-reasoning_end = "</reasoning>"
+reasoning_start = "<think>"
+reasoning_end = "</think>"
 solution_start = "<answer>"
 solution_end = "</answer>"
-match_format = re.compile(
-    rf"^[\s]{{0,}}"
-    rf"{reasoning_start}.+?{reasoning_end}.*?"
-    rf"{solution_start}(.+?){solution_end}"
-    rf"[\s]{{0,}}$",
-    flags=re.MULTILINE | re.DOTALL,
-)
 
 # binary reward function on format
-def check_format(prompts, completions, r=0.1, **kwargs):
+def check_format(
+    prompts,
+    completions,
+    r=0.1,
+    reasoning_start=reasoning_start,
+    reasoning_end=reasoning_end,
+    solution_start=solution_start,
+    solution_end=solution_end,
+    **kwargs,
+):
+  del prompts, kwargs
+  match_format = re.compile(
+      rf"^[\s]{{0,}}"
+      rf"{re.escape(reasoning_start)}.+?{re.escape(reasoning_end)}.*?"
+      rf"{re.escape(solution_start)}(.+?){re.escape(solution_end)}"
+      rf"[\s]{{0,}}$",
+      flags=re.MULTILINE | re.DOTALL,
+  )
   return [
       0 if match_format.search(response) is None else r
       for response in completions
@@ -43,9 +53,19 @@ def check_format(prompts, completions, r=0.1, **kwargs):
 
 # binary reward function on answer correctness
 # NB does not use sympy, only checks float equality 
-def check_answer(prompts, completions, answer, r=1, **kwargs):
+def check_answer(
+    prompts,
+    completions,
+    answer,
+    r=1,
+    solution_start=solution_start,
+    solution_end=solution_end,
+    **kwargs,
+):
+  del prompts, kwargs
   match_numbers = re.compile(
-      rf"{solution_start}.*?([\d\.]{{1,}})", flags=re.MULTILINE | re.DOTALL
+      rf"{re.escape(solution_start)}.*?([\d\.]{{1,}})",
+      flags=re.MULTILINE | re.DOTALL,
   )
   responses = completions
   extracted_responses = [

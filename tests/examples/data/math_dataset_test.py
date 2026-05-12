@@ -58,6 +58,12 @@ class _BaseDataset:
 
 class ApplyTemplateTest(parameterized.TestCase):
 
+  def test_default_system_prompt_uses_think_and_answer_tags(self):
+    self.assertIn("<think>", math_dataset.SYSTEM_PROMPT)
+    self.assertIn("</think>", math_dataset.SYSTEM_PROMPT)
+    self.assertIn("<answer>", math_dataset.SYSTEM_PROMPT)
+    self.assertIn("</answer>", math_dataset.SYSTEM_PROMPT)
+
   def test_with_tokenizer_uses_apply_chat_template_and_preserves_fields(self):
     ds = _BaseDataset([
         {"question": "Q1", "answer": "#### A1", "extra": 7},
@@ -85,6 +91,28 @@ class ApplyTemplateTest(parameterized.TestCase):
     self.assertEqual(len(call["msgs"]), 2)
     self.assertEqual(call["msgs"][1]["content"], "Q1")
     self.assertIn(math_dataset.SYSTEM_PROMPT, call["msgs"][0]["content"])
+
+  def test_custom_delimiters_are_used_in_system_prompt(self):
+    ds = _BaseDataset([
+        {"question": "Q-custom", "answer": "#### A-custom"},
+    ])
+    tok = _FakeTokenizer()
+
+    math_dataset.apply_template(
+        ds,
+        tokenizer=tok,
+        reasoning_start="<reasoning>",
+        reasoning_end="</reasoning>",
+        solution_start="<solution>",
+        solution_end="</solution>",
+    )
+
+    system_prompt = tok.calls[0]["msgs"][0]["content"]
+    self.assertIn("<reasoning>", system_prompt)
+    self.assertIn("</reasoning>", system_prompt)
+    self.assertIn("<solution>", system_prompt)
+    self.assertIn("</solution>", system_prompt)
+    self.assertNotIn("<think>", system_prompt)
 
   def test_without_tokenizer_falls_back_to_plain_template(self):
     ds = _BaseDataset([

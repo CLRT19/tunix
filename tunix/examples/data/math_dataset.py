@@ -20,18 +20,25 @@ import tensorflow_datasets as tfds
 # For OSS usage
 import tensorflow_datasets.text.gsm8k
 
-# reasoning_start = "<reasoning>"
-# reasoning_end = "</reasoning>"
 reasoning_start = "<think>"
 reasoning_end = "</think>"
 solution_start = "<answer>"
 solution_end = "</answer>"
 
 
-SYSTEM_PROMPT = f"""You are given a problem. Think about the problem and \
+def build_system_prompt(
+    reasoning_start: str = reasoning_start,
+    reasoning_end: str = reasoning_end,
+    solution_start: str = solution_start,
+    solution_end: str = solution_end,
+) -> str:
+  return f"""You are given a problem. Think about the problem and \
 provide your reasoning. Place it between {reasoning_start} and \
 {reasoning_end}. Then, provide the final answer (i.e., just one numerical \
 value) between {solution_start} and {solution_end}."""
+
+
+SYSTEM_PROMPT = build_system_prompt()
 
 TEMPLATE = """<start_of_turn>user
 {system_prompt}
@@ -52,15 +59,25 @@ def apply_template(
     tokenizer,
     tokenize=False,
     add_generation_prompt=True,
+    reasoning_start: str = reasoning_start,
+    reasoning_end: str = reasoning_end,
+    solution_start: str = solution_start,
+    solution_end: str = solution_end,
 ):
   """Applies chat template with tokenizer to dataset."""
 
+  system_prompt = build_system_prompt(
+      reasoning_start=reasoning_start,
+      reasoning_end=reasoning_end,
+      solution_start=solution_start,
+      solution_end=solution_end,
+  )
   _apply_template = None
   if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
     logging.info("Applying chat template with tokenizer to dataset")
     _apply_template = lambda question: tokenizer.apply_chat_template(
         [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
         ],
         tokenize=tokenize,
@@ -69,7 +86,7 @@ def apply_template(
   else:
     logging.info("Applying custom template to dataset")
     _apply_template = lambda question: TEMPLATE.format(
-        system_prompt=SYSTEM_PROMPT, question=question
+        system_prompt=system_prompt, question=question
     )
 
   def _process_element(x):
@@ -127,6 +144,10 @@ def create_dataset(
     tokenizer=None,
     tfds_download: bool = True,
     split: str = "train",
+    reasoning_start: str = reasoning_start,
+    reasoning_end: str = reasoning_end,
+    solution_start: str = solution_start,
+    solution_end: str = solution_end,
 ):
   """Creates a dataset based on the given name.
 
@@ -142,6 +163,10 @@ def create_dataset(
     tfds_download: the download flag when using TFDS datasets. If false, the
       data_dir used will be set to `None` and chosen by default by tfds.
     split: The dataset split to use (e.g., "train", "test").
+    reasoning_start: Opening tag for reasoning in the system prompt.
+    reasoning_end: Closing tag for reasoning in the system prompt.
+    solution_start: Opening tag for the final answer in the system prompt.
+    solution_end: Closing tag for the final answer in the system prompt.
 
   Returns:
     A batched grain.MapDataset or grain.experimental.ParquetIterDataset.
@@ -168,6 +193,14 @@ def create_dataset(
     )
 
   # Apply template
-  ds = apply_template(ds, tokenizer, tokenize=False)
+  ds = apply_template(
+      ds,
+      tokenizer,
+      tokenize=False,
+      reasoning_start=reasoning_start,
+      reasoning_end=reasoning_end,
+      solution_start=solution_start,
+      solution_end=solution_end,
+  )
 
   return ds

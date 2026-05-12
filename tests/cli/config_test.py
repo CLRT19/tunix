@@ -24,6 +24,7 @@ from flax import nnx
 import jax
 import optax
 from tunix.cli import config
+from tunix.cli import grpo_main
 from tunix.sft import peft_trainer
 from tunix.tests import test_common as tc
 from tunix.utils import env_utils
@@ -92,6 +93,44 @@ class ConfigTest(parameterized.TestCase):
     )
 
     peft_trainer.PeftTrainer(model, optimizer, training_config)
+
+  def create_grpo_rollout_config(self, overrides):
+    argv = ["grpo_main", "base_config.yaml"] + overrides
+    return grpo_main.GrpoPipeline(argv).create_rollout_config()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="model_id",
+          overrides=["model_config.model_id=Qwen/Qwen3-1.7B-base"],
+      ),
+      dict(
+          testcase_name="tokenizer_path",
+          overrides=["tokenizer_config.tokenizer_path=Qwen/Qwen3-1.7B-base"],
+      ),
+      dict(
+          testcase_name="rollout_vllm_model_version",
+          overrides=[
+              "rollout_config.rollout_vllm_model_version=Qwen/Qwen3-1.7B-base"
+          ],
+      ),
+  )
+  def test_grpo_rollout_config_defaults_qwen_eos_tokens(self, overrides):
+    rollout_config = self.create_grpo_rollout_config(overrides)
+
+    self.assertEqual(rollout_config.eos_tokens, [151643, 151645])
+
+  def test_grpo_rollout_config_preserves_explicit_eos_tokens(self):
+    rollout_config = self.create_grpo_rollout_config([
+        "model_config.model_id=Qwen/Qwen3-1.7B-base",
+        "rollout_config.eos_tokens=[7,21]",
+    ])
+
+    self.assertEqual(rollout_config.eos_tokens, [7, 21])
+
+  def test_grpo_rollout_config_leaves_non_qwen_eos_tokens_unset(self):
+    rollout_config = self.create_grpo_rollout_config([])
+
+    self.assertIsNone(rollout_config.eos_tokens)
 
   def test_config_from_yaml(self):
     non_existent_argv = ["", "nonexistent_config.yaml"]

@@ -76,5 +76,9 @@ grpo_config:
   num_iterations: 1
   beta: 0.08
   epsilon: 0.2
+  reasoning_start: "<think>"
+  reasoning_end: "</think>"
+  solution_start: "<answer>"
+  solution_end: "</answer>"
 reward_functions:
   - "tunix/cli/reward_fn/gsm8k.py"

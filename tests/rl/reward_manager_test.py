@@ -61,12 +61,26 @@ def nan_reward(
 nan_reward.__name__ = "nan_reward"
 
 
+def delimiter_reward(
+    prompts: List[str],
+    completions: List[str],
+    reasoning_start: str = "<default>",
+    **kwargs: Any,
+) -> List[float]:
+  del prompts, kwargs
+  return [float(reasoning_start in completion) for completion in completions]
+
+
+delimiter_reward.__name__ = "delimiter_reward"
+
+
 @dataclasses.dataclass(slots=True, kw_only=True)
 class TestAlgoConfig(algo_config_lib.AlgorithmConfig):
   """Test Algorithm Config."""
 
   reward_manager: str = "sequence-level"
   custom_param: float = 2.0
+  reasoning_start: str = "<think>"
 
 
 # --- Test Class ---
@@ -171,6 +185,18 @@ class SequenceRewardManagerTest(parameterized.TestCase):
     self.assertNotIn(
         "another_param", kwargs
     )  # Not in prompt_len_reward signature
+
+  def test_algo_config_delimiter_param_passing(self):
+    manager = reward_manager.SequenceRewardManager(
+        reward_fns=[delimiter_reward],
+        algo_config=self.test_algo_config,
+    )
+    rewards_info = manager(
+        ["p1", "p2"],
+        ["<think>ok</think>", "<reasoning>old</reasoning>"],
+    )
+
+    np.testing.assert_array_equal(rewards_info["rewards"], np.array([1.0, 0.0]))
 
   def test_nan_handling(self):
     manager = reward_manager.SequenceRewardManager(

@@ -77,6 +77,10 @@ class SglangJaxRollout(base_rollout.BaseRollout):
       **kwargs,
   ) -> base_rollout.RolloutOutput:
     """Generates samples from the model."""
+    sampling_kwargs = dict(kwargs)
+    if rollout_config.eos_tokens is not None:
+      sampling_kwargs["stop_token_ids"] = rollout_config.eos_tokens
+
     self.output = self._sampler(
         input_strings=prompts,
         max_generation_steps=rollout_config.max_tokens_to_generate,
@@ -87,7 +91,7 @@ class SglangJaxRollout(base_rollout.BaseRollout):
         seed=rollout_config.seed,
         echo=False,
         pad_output=True,
-        **kwargs,
+        **sampling_kwargs,
     )
 
     return base_rollout.RolloutOutput(

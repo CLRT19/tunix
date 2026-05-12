@@ -150,6 +150,14 @@ class GRPOConfig(algo_config_lib.AlgorithmConfig):
     loss_algo: use GRPO or GSPO for loss computation. GRPO loss is per-batch
       normalized instead of per-response normalized as mentioned in the paper.
       For GSPO, we use gspo-token loss which is more flexible.
+    reasoning_start: The opening tag for reasoning in math prompts and reward
+      parsing.
+    reasoning_end: The closing tag for reasoning in math prompts and reward
+      parsing.
+    solution_start: The opening tag for final answers in math prompts and
+      reward parsing.
+    solution_end: The closing tag for final answers in math prompts and reward
+      parsing.
 
   References:
     - GRPO: https://arxiv.org/abs/2402.03300
@@ -171,6 +179,10 @@ class GRPOConfig(algo_config_lib.AlgorithmConfig):
   num_iterations: int = 1
   beta: float = 0.04
   epsilon: float = 0.2
+  reasoning_start: str = "<think>"
+  reasoning_end: str = "</think>"
+  solution_start: str = "<answer>"
+  solution_end: str = "</answer>"
 
   def __post_init__(self):
     if self.num_generations <= 1:
@@ -392,10 +404,12 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
 
     with self.rl_cluster.perf.span("advantage_computation"):
       # Compute rewards and advantages
+      completion_token_counts = completion_mask.sum(axis=1).astype(np.int64)
       rewards = self._compute_rewards(
           prompts=training_input["prompts"],
           completions=rollout_output.text,
           mode=mode,
+          completion_token_counts=completion_token_counts.tolist(),
           **{k: v for k, v in training_input.items() if k != "prompts"},
       )
       if rewards.shape[0] != local_batch_size:

@@ -14,6 +14,7 @@
 
 """Main entry point for GRPO training."""
 
+import collections.abc
 import csv
 import dataclasses
 import os
@@ -38,6 +39,7 @@ from tunix.rl.grpo import grpo_learner
 from tunix.rl.rollout import base_rollout
 
 GrpoConfig = grpo_learner.GrpoConfig
+_QWEN_DEFAULT_EOS_TOKENS = [151643, 151645]
 
 _PATHWAYS_BNS = flags.DEFINE_string(
     "pathways_bns", None, "BNS address of the Pathways server."
@@ -202,6 +204,33 @@ def _create_trajectory_csv_logger(log_dir, max_rows_per_step):
   return logger
 
 
+def _config_uses_qwen_model(config_dict):
+  """Returns true when the configured model/tokenizer appears to be Qwen."""
+  candidate_values = []
+  for section_name in (
+      "model_config",
+      "actor_model_config",
+      "reference_model_config",
+      "rollout_model_config",
+      "tokenizer_config",
+      "rollout_config",
+  ):
+    section = config_dict.get(section_name, {})
+    if not isinstance(section, collections.abc.Mapping):
+      continue
+    for key in (
+        "model_name",
+        "model_id",
+        "model_path",
+        "tokenizer_path",
+        "rollout_vllm_model_version",
+    ):
+      value = section.get(key)
+      if value:
+        candidate_values.append(str(value).lower())
+  return any("qwen" in value for value in candidate_values)
+
+
 class GrpoPipeline(config.HyperParameters):
   """Class for running the GRPO trainer."""
 
@@ -231,6 +260,17 @@ class GrpoPipeline(config.HyperParameters):
           rollout_config["max_prompt_length"]
           + rollout_config["total_generation_steps"]
           + 256
+      )
+    if (
+        filtered_config.get("eos_tokens") is None
+        and _config_uses_qwen_model(self.config)
+    ):
+      # Qwen chat templates terminate assistant turns with <|im_end|> (151645)
+      # while tokenizer.eos_token_id is usually <|endoftext|> (151643).
+      filtered_config["eos_tokens"] = list(_QWEN_DEFAULT_EOS_TOKENS)
+      logging.info(
+          "Defaulting Qwen rollout eos_tokens to %s.",
+          filtered_config["eos_tokens"],
       )
 
     return base_rollout.RolloutConfig(**filtered_config)
@@ -380,6 +420,13 @@ class GrpoPipeline(config.HyperParameters):
       )
 
     tokenizer = grpo_trainer.rl_cluster.tokenizer
+    grpo_config = self.config["grpo_config"]
+    delimiter_config = {
+        "reasoning_start": grpo_config.get("reasoning_start", "<think>"),
+        "reasoning_end": grpo_config.get("reasoning_end", "</think>"),
+        "solution_start": grpo_config.get("solution_start", "<answer>"),
+        "solution_end": grpo_config.get("solution_end", "</answer>"),
+    }
     if self.config.get("data_module", None):
       dataset = data_lib.get_dataset_from_module(
           self.config["data_module"],
@@ -390,6 +437,7 @@ class GrpoPipeline(config.HyperParameters):
           data_source=self.config["data_source"],
           dataset=self.config["data_directory"],
           tokenizer=tokenizer,
+          **delimiter_config,
       )
     else:
       dataset = example_data.create_dataset(
@@ -397,6 +445,7 @@ class GrpoPipeline(config.HyperParameters):
           dataset=self.config["dataset_name"],
           tokenizer=tokenizer,
           tfds_download=self.config["tfds_download"],
+          **delimiter_config,
       )
     dataset, _ = data_lib.post_init_dataset(
         dataset,
@@ -406,6 +455,7 @@ class GrpoPipeline(config.HyperParameters):
         max_prompt_length=self.config["rollout_config"].get(
             "max_prompt_length", None
         ),
+        num_epochs=self.config.get("num_train_epochs", 1),
         shard_by_process=jax.process_count() > 1,
         batch_size_is_global=True,
     )
