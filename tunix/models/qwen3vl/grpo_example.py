@@ -397,11 +397,14 @@ def main():
       processor=processor,
       cache_config_or_size=ROLLOUT_CACHE_SIZE,
   )
+  _temp = float(os.environ.get('QWEN3VL_TEMPERATURE', '1.0'))
+  _top_p_env = os.environ.get('QWEN3VL_TOP_P', '0.95')
+  _top_p = None if _top_p_env in ('', 'none', 'None') else float(_top_p_env)
   rollout_config = base_rollout.RolloutConfig(
       max_tokens_to_generate=MAX_NEW_TOKENS,
       max_prompt_length=ROLLOUT_PROMPT_LEN,
-      temperature=1.0,
-      top_p=0.95,
+      temperature=_temp,
+      top_p=_top_p,
   )
 
   # --- Optimizer (constructed and sharded inside the mesh) ---
