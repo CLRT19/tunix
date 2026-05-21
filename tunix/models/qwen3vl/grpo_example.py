@@ -444,7 +444,10 @@ def main():
     labels = [b['label'] for b in batch for _ in range(NUM_GENERATIONS)]
     prompt_strs = [_apply_chat_template(processor, q) for q in questions]
 
-    # 3. Rollout.
+    # 3. Rollout. Vary the seed per step so we actually explore — without
+    # this the sampler is deterministic and overfit mode (fixed prompts)
+    # would loop at the same completions forever.
+    rollout_config.seed = step
     logger.info('[step %d] rolling out %d completions', step, len(prompt_strs))
     rollout_out = rollout.generate(
         prompts=prompt_strs,
@@ -473,8 +476,11 @@ def main():
           ROLLOUT_PROMPT_LEN,
       )
 
-    # 4. Score.
-    rewards = np.array(
+    # 4. Score. Combine answer-match (1.0) and format-shape (0.1) so the
+    # reward is dense early — getting just <think>...<answer> right gets
+    # 0.1 even if the answer is wrong, which produces nonzero advantages
+    # before the model stumbles onto correct answers.
+    answer_rewards = np.array(
         chartqa_reward.check_answer(
             prompts=questions,
             completions=rollout_out.text,
@@ -482,6 +488,13 @@ def main():
         ),
         dtype=np.float32,
     )
+    format_rewards = np.array(
+        chartqa_reward.check_format(
+            prompts=questions, completions=rollout_out.text
+        ),
+        dtype=np.float32,
+    )
+    rewards = answer_rewards + format_rewards
 
     # 5. Group-relative advantages: (r - mean) / (std + eps).
     grouped = rewards.reshape(NUM_PROMPTS, NUM_GENERATIONS)
