@@ -51,6 +51,7 @@ from flax import nnx
 from grain import python as grain
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
@@ -100,6 +101,14 @@ CKPT_EVERY_N_STEPS = int(os.environ.get('QWEN3VL_CKPT_EVERY_N_STEPS', '2'))
 CKPT_DIR = os.environ.get(
     'QWEN3VL_CKPT_DIR', '/tmp/qwen3vl_grpo_chartqa_ckpts'
 )
+# Optional resume-from-checkpoint: point at a manager directory (the
+# parent of step subdirs) and pass the step number separately. Only
+# model params are restored — optimizer state is NOT saved by this
+# trainer, so the resumed run starts with a fresh AdamW. Model-correct
+# but not trajectory-identical (acceptable for smoke verification).
+RESUME_FROM = os.environ.get('QWEN3VL_RESUME_FROM') or None
+RESUME_FROM_STEP_STR = os.environ.get('QWEN3VL_RESUME_FROM_STEP')
+RESUME_FROM_STEP = int(RESUME_FROM_STEP_STR) if RESUME_FROM_STEP_STR else None
 MESH_SHAPE = tuple(
     int(x) for x in os.environ.get('QWEN3VL_MESH_SHAPE', '1,1').split(',')
 )
@@ -302,7 +311,16 @@ def _shard_optimizer_state(optimizer: nnx.Optimizer, mesh: jax.sharding.Mesh):
 
 def main():
   _maybe_initialize_jax_distributed()
-  jax.config.update('jax_compilation_cache_dir', '/tmp/jax_cache')
+  # Persistent compile cache. Prefer a native gs:// path so the cache is
+  # shared across all hosts and survives reboots; JAX uses etils.epath
+  # for paths containing `://`. A gcsfuse mount is treated as local (no
+  # `://`) and would skip locking — unsafe under multi-host writes.
+  # See jax/_src/lru_cache.py:39 + jax/_src/compiler.py:796 (writes only
+  # from process_id == 0, so cross-host write contention is mitigated).
+  jax.config.update(
+      'jax_compilation_cache_dir',
+      os.environ.get('JAX_COMPILATION_CACHE_DIR', '/tmp/jax_cache'),
+  )
   jax.config.update('jax_explain_cache_misses', True)
   is_primary = jax.process_index() == 0
   if is_primary:
@@ -334,6 +352,36 @@ def main():
       model_dir, config, mesh=mesh, dtype=jnp.bfloat16
   )
   show_hbm_usage()
+
+  # Optional warm-start from a previous checkpoint. Restores ONLY model
+  # params (the saver writes plain PyTreeSave(nnx.state(model))), so the
+  # AdamW state begins fresh. Sharding for the restored arrays is derived
+  # from the live nnx.state(model) target via construct_restore_args —
+  # this mirrors tunix/sft/checkpoint_manager.py:178.
+  if RESUME_FROM:
+    if RESUME_FROM_STEP is None:
+      raise RuntimeError(
+          'QWEN3VL_RESUME_FROM is set but QWEN3VL_RESUME_FROM_STEP is not.'
+      )
+    logger.info(
+        'Resuming model params from %s step %d',
+        RESUME_FROM,
+        RESUME_FROM_STEP,
+    )
+    resume_mgr = ocp.CheckpointManager(directory=RESUME_FROM)
+    abstract_params = nnx.state(model)
+    restore_args = ocp.checkpoint_utils.construct_restore_args(
+        target=abstract_params
+    )
+    restored = resume_mgr.restore(
+        RESUME_FROM_STEP,
+        args=ocp.args.PyTreeRestore(
+            item=abstract_params, restore_args=restore_args
+        ),
+    )
+    nnx.update(model, restored)
+    resume_mgr.close()
+    show_hbm_usage()
 
   processor = load_processor(model_dir)
 
@@ -386,6 +434,27 @@ def main():
         rollout_config=rollout_config,
         images=images,
     )
+
+    # 3b. One-time cluster-wide assertion that every host padded the
+    # prompt to the same forced length. The Phase 4 silent-death failure
+    # mode was per-process prompt-length divergence → different compiled
+    # decode graphs → the run hangs ~7 min in with no traceback. This
+    # check makes the regression loud at step 1 instead of silent later.
+    if step == 1:
+      local_len = jnp.asarray(rollout_out.prompt_seq_len, dtype=jnp.int32)
+      all_lens = multihost_utils.process_allgather(local_len)
+      all_lens_np = np.asarray(all_lens)
+      if not np.all(all_lens_np == ROLLOUT_PROMPT_LEN):
+        raise RuntimeError(
+            f'prompt_seq_len mismatch across hosts: got {all_lens_np.tolist()},'
+            f' expected {ROLLOUT_PROMPT_LEN}. Sampler is no longer respecting'
+            ' forced_prompt_length — multi-host SPMD will silent-die.'
+        )
+      logger.info(
+          '[step 1] prompt_seq_len OK across %d hosts: %d',
+          int(all_lens_np.size),
+          ROLLOUT_PROMPT_LEN,
+      )
 
     # 4. Score.
     rewards = np.array(
@@ -453,6 +522,11 @@ def main():
           advantages=advantages,
       )
     logger.info('[step %d] loss=%.4f', step, float(loss))
+
+    # 7b. Characterize peak HBM after step 1 (rollout + train step both
+    # done) so we know our margin to OOM. Cheap; one-shot.
+    if step == 1:
+      show_hbm_usage()
 
     # Save checkpoint at the configured cadence.
     if step % CKPT_EVERY_N_STEPS == 0:
