@@ -291,6 +291,18 @@ class Qwen3VLSampler:
     pos = state.next_position[:, None]  # [B, 1]
     positions_3d = jnp.stack([pos, pos, pos], axis=0)  # [3, B, 1]
 
+    # KV-cache validity mask. With left-padded prompts the cache holds
+    # hundreds of pad-token K/V entries (slots 0..pad_len-1); without
+    # this mask the decode step attends to them and produces gibberish.
+    # token_buffer position i aligns with cache slot i, so pad/not-yet-
+    # generated slots are exactly where token_buffer == pad_id.
+    pad_id = (
+        self._tokenizer.pad_token_id
+        if self._tokenizer.pad_token_id is not None
+        else self._tokenizer.eos_token_id
+    )
+    cache_padding_mask = state.token_buffer != jnp.int32(pad_id)  # [B, buf]
+
     model = nnx.merge(self._model_graphdef, params)
     logits, new_cache = model(
         last_token,
@@ -298,7 +310,7 @@ class Qwen3VLSampler:
         None,  # pixel_values
         None,  # vision_precomputed
         state.cache,
-        None,  # attention_mask (single real token, no padding)
+        cache_padding_mask,  # gate out left-pad slots in the KV cache
     )
 
     next_token, new_seed = self._sample_token(

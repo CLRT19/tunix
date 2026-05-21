@@ -932,6 +932,19 @@ class Qwen3VL(BackendMappingMixin, nnx.Module):
         causal_mask = jnp.broadcast_to(
             causal_mask, (input_tokens.shape[0], 1, cache_size)
         )
+        # Gate out KV slots holding pad / not-yet-generated tokens. Without
+        # this, left-padded prompts leave hundreds of pad-token K/V entries
+        # in the cache that the decode token would attend to, producing
+        # incoherent output. padding_mask is [B, buffer_len]; align it to
+        # the cache key axis (pad with False, truncate if longer).
+        if padding_mask is not None:
+          key_mask = padding_mask.astype(jnp.bool_)
+          pad_len = cache_size - key_mask.shape[-1]
+          if pad_len > 0:
+            key_mask = jnp.pad(key_mask, [(0, 0), (0, pad_len)])
+          elif pad_len < 0:
+            key_mask = key_mask[:, :cache_size]
+          causal_mask = causal_mask & key_mask[:, None, :]
       else:
         # Prefill: standard causal mask padded to cache_size with False so that
         # empty slots beyond the prompt length are blocked.
