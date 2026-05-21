@@ -109,6 +109,12 @@ CKPT_DIR = os.environ.get(
 RESUME_FROM = os.environ.get('QWEN3VL_RESUME_FROM') or None
 RESUME_FROM_STEP_STR = os.environ.get('QWEN3VL_RESUME_FROM_STEP')
 RESUME_FROM_STEP = int(RESUME_FROM_STEP_STR) if RESUME_FROM_STEP_STR else None
+# Overfit mode: when set, capture NUM_PROMPTS prompts once at start-up
+# and reuse the same batch for every training step. Used to demonstrate
+# the GRPO loop actually optimises (reward should climb toward 1.0 over
+# a few dozen steps) — mirrors gs1693's qwen3 simplereward_overfit_128
+# experiment in spirit, scaled down for this trainer.
+OVERFIT = os.environ.get('QWEN3VL_OVERFIT', '0') in ('1', 'true', 'True')
 MESH_SHAPE = tuple(
     int(x) for x in os.environ.get('QWEN3VL_MESH_SHAPE', '1,1').split(',')
 )
@@ -407,6 +413,13 @@ def main():
 
   # --- Dataset ---
   data_iter = iter(create_dataset())
+  fixed_batch: list[dict[str, Any]] | None = None
+  if OVERFIT:
+    fixed_batch = [next(data_iter) for _ in range(NUM_PROMPTS)]
+    logger.info(
+        '[overfit] captured %d fixed prompts; will reuse for every step',
+        len(fixed_batch),
+    )
 
   # --- Checkpoint manager (process-0 writes; others participate in collective save) ---
   ckpt_mgr = ocp.CheckpointManager(
@@ -418,8 +431,12 @@ def main():
   )
 
   for step in range(1, MAX_STEPS + 1):
-    # 1. Sample NUM_PROMPTS prompts on each process.
-    batch = [next(data_iter) for _ in range(NUM_PROMPTS)]
+    # 1. Sample NUM_PROMPTS prompts on each process (or reuse the fixed
+    # batch when running in overfit mode).
+    if fixed_batch is not None:
+      batch = fixed_batch
+    else:
+      batch = [next(data_iter) for _ in range(NUM_PROMPTS)]
 
     # 2. Tile to NUM_GENERATIONS per prompt.
     questions = [b['question'] for b in batch for _ in range(NUM_GENERATIONS)]
