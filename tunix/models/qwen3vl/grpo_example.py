@@ -238,19 +238,20 @@ def grpo_loss_fn(
 # ---------------------------------------------------------------------------
 
 
-def _build_train_step(loss_fn):
-  """JIT-compiled grad step. Returns (loss, new_model, new_opt_state)."""
+def _train_step(
+    model: model_lib.Qwen3VL,
+    optimizer: nnx.Optimizer,
+    batch_kwargs: dict,
+    advantages: jax.Array,
+):
+  """Single grad step. Mutates `model` and `optimizer` in place."""
 
-  def step_fn(model, opt_state, optimizer, batch_kwargs, advantages):
-    def loss_only(m):
-      return loss_fn(m, **batch_kwargs, advantages=advantages)
+  def loss_only(m):
+    return grpo_loss_fn(m, **batch_kwargs, advantages=advantages)
 
-    loss, grads = nnx.value_and_grad(loss_only)(model)
-    updates, opt_state = optimizer.update(grads, opt_state, nnx.state(model))
-    nnx.update(model, optax.apply_updates(nnx.state(model), updates))
-    return loss, opt_state
-
-  return step_fn
+  loss, grads = nnx.value_and_grad(loss_only)(model)
+  optimizer.update(model, grads)
+  return loss
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +304,9 @@ def main():
   )
 
   # --- Optimizer ---
-  optimizer = optax.adamw(LEARNING_RATE)
-  opt_state = optimizer.init(nnx.state(model))
+  optimizer = nnx.Optimizer(
+      model, optax.adamw(LEARNING_RATE), wrt=nnx.Param
+  )
 
   # --- Dataset ---
   data_iter = iter(create_dataset())
@@ -317,8 +319,6 @@ def main():
           max_to_keep=3,
       ),
   )
-
-  step_fn = _build_train_step(grpo_loss_fn)
 
   for step in range(1, MAX_STEPS + 1):
     # 1. Sample NUM_PROMPTS prompts on each process.
@@ -400,9 +400,7 @@ def main():
 
     # 7. Grad step.
     with mesh:
-      loss, opt_state = step_fn(
-          model, opt_state, optimizer, batch_kwargs, advantages
-      )
+      loss = _train_step(model, optimizer, batch_kwargs, advantages)
     logger.info('[step %d] loss=%.4f', step, float(loss))
 
     # Save checkpoint at the configured cadence.
