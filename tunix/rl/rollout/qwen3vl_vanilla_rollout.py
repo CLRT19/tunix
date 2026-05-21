@@ -157,6 +157,7 @@ class Qwen3VLVanillaRollout(base_rollout.BaseRollout):
         tokens=out['completion_tokens'],
         left_padded_prompt_tokens=prompt_tokens,
         logprobs=None,
+        prompt_seq_len=int(out['prompt_seq_len']),
     )
 
   def get_per_token_logps(

@@ -63,6 +63,13 @@ class RolloutOutput:
   # The log probs from sampler generations.
   logprobs: list[np.ndarray] | None
 
+  # Pad boundary used for the prompt this rollout. Multi-host SPMD
+  # requires this to be identical across hosts so the decode JIT compiles
+  # one graph cluster-wide; see Qwen3VLSampler.generate_with_tokens(
+  # forced_prompt_length=...). None if the rollout did not pad to a
+  # forced boundary.
+  prompt_seq_len: int | None = None
+
 
 @dataclasses.dataclass
 class RolloutConfig:
