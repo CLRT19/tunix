@@ -269,7 +269,13 @@ def main():
 
   # --- Mesh + model ---
   config = model_lib.ModelConfig.qwen3vl_4b()
-  config.remat_config = model_lib.RematConfig.BLOCK
+  # nnx.remat conflicts with the sampler's jax.lax.while_loop (decode loop):
+  # the inner forward pass mutates Param state at a different trace level
+  # inside the while_loop body and raises TraceContextError. The SFT path
+  # disables remat only for sample generation and restores it; GRPO does
+  # rollouts every step, so we disable it for the whole run. 4B params at
+  # bf16 on 32 v5p chips fits comfortably without remat for our smoke.
+  config.remat_config = model_lib.RematConfig.NONE
   model_dir = resolve_model_dir(MODEL_ID)
   logger.info(
       'Loading Qwen3-VL from %s on mesh %s (proc %d/%d)',
