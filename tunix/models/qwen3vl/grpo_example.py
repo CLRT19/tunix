@@ -496,6 +496,21 @@ def main():
     )
     rewards = answer_rewards + format_rewards
 
+    # Diagnostic: show what the model actually produced for the first
+    # completion so we can tell empty/truncated/no-format apart.
+    if is_primary:
+      _first = rollout_out.text[0] if rollout_out.text else ''
+      logger.info(
+          '[step %d] completion[0] len=%d label=%r ans_r=%.2f fmt_r=%.2f'
+          ' text=%r',
+          step,
+          len(_first),
+          labels[0],
+          float(answer_rewards[0]),
+          float(format_rewards[0]),
+          _first[:300],
+      )
+
     # 5. Group-relative advantages: (r - mean) / (std + eps).
     grouped = rewards.reshape(NUM_PROMPTS, NUM_GENERATIONS)
     mean = grouped.mean(axis=-1, keepdims=True)
