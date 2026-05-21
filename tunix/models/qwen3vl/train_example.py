@@ -47,6 +47,7 @@ from grain import python as grain
 import huggingface_hub
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import qwix
 from transformers import AutoProcessor
@@ -83,6 +84,10 @@ MAX_IMAGE_SIZE = int(os.environ.get('QWEN3VL_MAX_IMAGE_SIZE', '1280'))
 USE_QUANTIZATION = os.environ.get('QWEN3VL_QUANTIZATION', '0') == '1'
 LORA_RANK = int(os.environ.get('QWEN3VL_LORA_RANK', '16'))
 LORA_ALPHA = float(os.environ.get('QWEN3VL_LORA_ALPHA', str(2 * LORA_RANK)))
+# Skip qwix.apply_lora_to_model and train the full model. Needed for
+# multi-host runs until qwix's tracing pass is compatible with the
+# trainer's mesh + jit setup.
+SKIP_LORA = os.environ.get('QWEN3VL_SKIP_LORA', '0') == '1'
 
 MAX_STEPS = int(os.environ.get('QWEN3VL_MAX_STEPS', '100'))
 EVAL_EVERY_N_STEPS = int(os.environ.get('QWEN3VL_EVAL_EVERY_N_STEPS', '20'))
@@ -144,7 +149,14 @@ class _PrepareConversation(grain.MapTransform):
 
   def map(self, element: dict[str, Any]) -> dict[str, Any]:
     image = element['image'].convert('RGB')
-    if max(image.size) > MAX_IMAGE_SIZE:
+    # For multi-host training the SPMD JIT requires every process to trace
+    # the same graph, which means identical patch counts across processes.
+    # In single-host runs we keep the cheaper aspect-ratio-preserving
+    # thumbnail; under multi-host we resize to a fixed square so the vision
+    # encoder sees the same number of patches in every example.
+    if jax.process_count() > 1:
+      image = image.resize((MAX_IMAGE_SIZE, MAX_IMAGE_SIZE))
+    elif max(image.size) > MAX_IMAGE_SIZE:
       image.thumbnail((MAX_IMAGE_SIZE, MAX_IMAGE_SIZE))
     conversation = [
         {
@@ -407,7 +419,18 @@ def main():
       jax.process_index(),
       jax.process_count(),
   )
-  mesh = jax.make_mesh(MESH_SHAPE, ('fsdp', 'tp'))
+  # Use plain `jax.sharding.Mesh` over a row-major reshape of `jax.devices()`
+  # rather than `jax.make_mesh`. Matches `tunix/cli/config.py`'s
+  # `_build_mesh` (used by the GRPO path), which keeps each JAX process's
+  # local devices on a contiguous slice of the leading axis. `make_mesh`
+  # uses `mesh_utils.create_device_mesh` which can reorder devices and
+  # silently halve the per-process batch on multi-host pods. Default axis
+  # types (Auto) match what the trainer's jit expects.
+  if jax.process_count() > 1 or any(s > 1 for s in MESH_SHAPE):
+    devices = np.asarray(jax.devices(), dtype=object).reshape(tuple(MESH_SHAPE))
+    mesh = jax.sharding.Mesh(devices, ('fsdp', 'tp'))
+  else:
+    mesh = jax.make_mesh(MESH_SHAPE, ('fsdp', 'tp'))
   base_model = params_lib.create_model_from_safe_tensors(
       model_dir, config, mesh=mesh, dtype=jnp.bfloat16
   )
@@ -416,12 +439,19 @@ def main():
   # --- Processor (tokenizer + image processor, no PyTorch required) ---
   processor = load_processor(model_dir)
 
-  # --- LoRA model ---
-  method = 'QLoRA' if USE_QUANTIZATION else 'LoRA'
-  logger.info(
-      'Applying %s (rank=%d, alpha=%.0f)', method, LORA_RANK, LORA_ALPHA
-  )
-  lora_model = get_lora_model(base_model, mesh=mesh, quantize=USE_QUANTIZATION)
+  # --- LoRA model (optional) ---
+  if SKIP_LORA:
+    method = 'full-FT (LoRA skipped)'
+    logger.info('Skipping LoRA; training the full base model.')
+    lora_model = base_model
+  else:
+    method = 'QLoRA' if USE_QUANTIZATION else 'LoRA'
+    logger.info(
+        'Applying %s (rank=%d, alpha=%.0f)', method, LORA_RANK, LORA_ALPHA
+    )
+    lora_model = get_lora_model(
+        base_model, mesh=mesh, quantize=USE_QUANTIZATION
+    )
   show_hbm_usage()
 
   # --- Pick a fixed eval sample for before/after comparison ---

@@ -288,19 +288,7 @@ class Embedder(nnx.Module):
 
   @jax.named_scope('embedder_encode')
   def encode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
-    # Under multi-host JAX 0.10+, gathering rows from an embedding table
-    # whose vocab axis is `tp`-sharded (emb_vd=('tp','fsdp')) is ambiguous:
-    # JAX can't infer the output sharding because the gather axis is
-    # sharded. Provide an explicit out_sharding that keeps the hidden dim
-    # on `fsdp` (matching the operand) and replicates the indexed dims;
-    # the subsequent `shard(...act_btd)` reshards to the activation layout.
-    # Single-host runs fall back to the original code path.
-    mesh = pxla.thread_resources.env.physical_mesh
-    if mesh.empty or jax.devices()[0].platform == 'cpu':
-      x = self.input_embedding[(x,)]
-    else:
-      out_pspec = shd.PartitionSpec(*([None] * x.ndim + ['fsdp']))
-      x = self.input_embedding.value.at[x].get(out_sharding=out_pspec)
+    x = self.input_embedding[(x,)]
     x = shard(x, self.shd_config.act_btd)
     return x
 
