@@ -378,6 +378,114 @@ class Qwen3VLSampler:
   # Public interface
   # ------------------------------------------------------------------
 
+  def generate_with_tokens(
+      self,
+      prompts: str | Sequence[str],
+      max_new_tokens: int = 100,
+      images=None,
+      temperature: float = 1.0,
+      top_p: Optional[float] = None,
+      top_k: Optional[int] = None,
+      eos_tokens: Sequence[int] | None = None,
+      forbidden_tokens: Sequence[int] | None = None,
+      seed: int = 0,
+  ):
+    """Generate and return both decoded strings and raw token arrays.
+
+    Returns a dict with:
+      texts: list[str]                — decoded completions, one per prompt
+      prompt_tokens: np.ndarray [B, L_prompt] — left-padded prompt token ids
+      completion_tokens: list[np.ndarray]    — per-sample completion tokens,
+          trimmed at the first EOS and stripped of pad tokens
+      token_buffer: np.ndarray [B, total_steps] — full buffer (prompt + gen)
+      prompt_seq_len: int             — left-padded prompt length L_prompt
+    """
+    if isinstance(prompts, str):
+      prompts = [prompts]
+
+    sampling_mode = 'top_p' if top_p is not None else 'greedy'
+    forbidden_token_ids = tuple(forbidden_tokens) if forbidden_tokens else None
+    rng = jax.random.PRNGKey(seed)
+
+    eos_id = self._tokenizer.eos_token_id
+    eos_ids = jnp.array(eos_tokens if eos_tokens else [eos_id])
+
+    image_lists = (
+        [[img] for img in images]
+        if images is not None
+        else [[] for _ in prompts]
+    )
+    batch = encode_batch(
+        self._processor,
+        list(prompts),
+        image_lists,
+        vcfg=self._config.vision_config,
+        max_length=self._cache_size,
+        truncation=False,
+        pad_to_multiple_of=128,
+        padding_side='left',
+    )
+
+    seq_len = batch.input_tokens.shape[1]
+    total_sampling_steps = seq_len + max_new_tokens
+    if total_sampling_steps > self._cache_size:
+      raise ValueError(
+          f'seq_len ({seq_len}) + max_new_tokens ({max_new_tokens}) = '
+          f'{total_sampling_steps} exceeds cache_size {self._cache_size}.'
+      )
+
+    state = self._prefill(
+        input_ids=batch.input_tokens,
+        attention_mask=batch.input_mask,
+        positions_3d=jnp.array(batch.positions),
+        total_sampling_steps=total_sampling_steps,
+        vision_grid=batch.vision_grid,
+        pixel_values=batch.pixel_values,
+        sampling_mode=sampling_mode,
+        temperature=temperature,
+        top_p=top_p if top_p is not None else 1.0,
+        top_k=top_k,
+        forbidden_token_ids=forbidden_token_ids,
+        seed=rng,
+        include_logits=False,
+    )
+
+    state = self._compiled_decode_fn(
+        self._flattened_model_state, state, eos_ids
+    )
+
+    pad_id = (
+        self._tokenizer.pad_token_id
+        if self._tokenizer.pad_token_id is not None
+        else eos_id
+    )
+    token_buffer_np = np.array(state.token_buffer)
+    eos_set = set(np.array(eos_ids).tolist())
+
+    texts: list[str] = []
+    completion_tokens: list[np.ndarray] = []
+    for tb in token_buffer_np:
+      gen = tb[seq_len:]
+      cut = len(gen)
+      for j, tok in enumerate(gen):
+        if int(tok) in eos_set:
+          cut = j
+          break
+      comp = gen[:cut]
+      comp_no_pad = comp[comp != pad_id]
+      completion_tokens.append(comp_no_pad.astype(np.int32))
+      texts.append(
+          self._tokenizer.decode(comp_no_pad.tolist(), skip_special_tokens=True)
+      )
+
+    return {
+        'texts': texts,
+        'prompt_tokens': batch.input_tokens.astype(np.int32),
+        'completion_tokens': completion_tokens,
+        'token_buffer': token_buffer_np.astype(np.int32),
+        'prompt_seq_len': int(seq_len),
+    }
+
   def __call__(
       self,
       prompts: str | Sequence[str],
