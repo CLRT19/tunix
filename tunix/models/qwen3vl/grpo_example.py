@@ -84,6 +84,13 @@ NUM_GENERATIONS = int(os.environ.get('QWEN3VL_NUM_GENERATIONS', '4'))
 MAX_NEW_TOKENS = int(os.environ.get('QWEN3VL_MAX_NEW_TOKENS', '128'))
 MAX_SEQ_LEN = int(os.environ.get('QWEN3VL_MAX_SEQ_LEN', '1536'))
 ROLLOUT_CACHE_SIZE = int(os.environ.get('QWEN3VL_ROLLOUT_CACHE_SIZE', '1536'))
+# Forced prompt length for the sampler. Required for multi-host SPMD:
+# each process pads to the same boundary, so the decode JIT compiles a
+# single graph cluster-wide. Should cover system+chat-template tokens +
+# vision image-pad tokens (256 for 512x512 image) + question text +
+# generation-prompt suffix. Default 768 leaves ~256 tokens for the
+# question and template overhead.
+ROLLOUT_PROMPT_LEN = int(os.environ.get('QWEN3VL_ROLLOUT_PROMPT_LEN', '768'))
 MAX_IMAGE_SIZE = int(os.environ.get('QWEN3VL_MAX_IMAGE_SIZE', '512'))
 
 LEARNING_RATE = float(os.environ.get('QWEN3VL_LR', '1e-6'))
@@ -238,20 +245,54 @@ def grpo_loss_fn(
 # ---------------------------------------------------------------------------
 
 
-def _train_step(
+def _train_step_impl(
     model: model_lib.Qwen3VL,
     optimizer: nnx.Optimizer,
-    batch_kwargs: dict,
+    input_tokens: jax.Array,
+    positions: jax.Array,
+    pixel_values: jax.Array,
+    vision_grid,
+    padding_mask: jax.Array,
+    completion_mask: jax.Array,
     advantages: jax.Array,
-):
+) -> jax.Array:
   """Single grad step. Mutates `model` and `optimizer` in place."""
 
   def loss_only(m):
-    return grpo_loss_fn(m, **batch_kwargs, advantages=advantages)
+    return grpo_loss_fn(
+        m,
+        input_tokens=input_tokens,
+        positions=positions,
+        pixel_values=pixel_values,
+        vision_grid=vision_grid,
+        padding_mask=padding_mask,
+        completion_mask=completion_mask,
+        advantages=advantages,
+    )
 
   loss, grads = nnx.value_and_grad(loss_only)(model)
   optimizer.update(model, grads)
   return loss
+
+
+# Jitted version, donating the optimizer state in place. Mirrors
+# tunix.sft.peft_trainer's jit_train_and_eval_step pattern.
+_train_step = nnx.jit(_train_step_impl, donate_argnames=('optimizer',))
+
+
+def _shard_optimizer_state(optimizer: nnx.Optimizer, mesh: jax.sharding.Mesh):
+  """Apply sharding constraints to the optimizer state. Mirrors
+  ``tunix.sft.peft_trainer.PeftTrainer._shard_optimizer``. Without this,
+  the first jit call compiles twice and may put state on a single device.
+  """
+  if mesh.empty:
+    return
+  optimizer_state = nnx.state(optimizer, nnx.optimizer.OptState)
+  optimizer_pspecs = nnx.get_partition_spec(optimizer_state)
+  optimizer_sharded_state = jax.lax.with_sharding_constraint(
+      optimizer_state, optimizer_pspecs
+  )
+  nnx.update(optimizer, optimizer_sharded_state)
 
 
 # ---------------------------------------------------------------------------
@@ -304,15 +345,17 @@ def main():
   )
   rollout_config = base_rollout.RolloutConfig(
       max_tokens_to_generate=MAX_NEW_TOKENS,
-      max_prompt_length=MAX_SEQ_LEN - MAX_NEW_TOKENS,
+      max_prompt_length=ROLLOUT_PROMPT_LEN,
       temperature=1.0,
       top_p=0.95,
   )
 
-  # --- Optimizer ---
-  optimizer = nnx.Optimizer(
-      model, optax.adamw(LEARNING_RATE), wrt=nnx.Param
-  )
+  # --- Optimizer (constructed and sharded inside the mesh) ---
+  with mesh:
+    optimizer = nnx.Optimizer(
+        model, optax.adamw(LEARNING_RATE), wrt=nnx.Param
+    )
+    _shard_optimizer_state(optimizer, mesh)
 
   # --- Dataset ---
   data_iter = iter(create_dataset())
@@ -394,19 +437,21 @@ def main():
         truncation=True,
     )
 
-    batch_kwargs = dict(
-        input_tokens=jnp.array(encoded.input_tokens),
-        positions=jnp.array(encoded.positions),
-        pixel_values=jnp.array(encoded.pixel_values, dtype=jnp.bfloat16),
-        vision_grid=encoded.vision_grid,
-        padding_mask=jnp.array(encoded.input_mask).astype(jnp.bool_),
-        completion_mask=jnp.array(encoded.completion_mask),
-    )
     advantages = jnp.array(advantages_np, dtype=jnp.float32)
 
-    # 7. Grad step.
+    # 7. Grad step (jitted, optimizer donated in place).
     with mesh:
-      loss = _train_step(model, optimizer, batch_kwargs, advantages)
+      loss = _train_step(
+          model,
+          optimizer,
+          input_tokens=jnp.array(encoded.input_tokens),
+          positions=jnp.array(encoded.positions),
+          pixel_values=jnp.array(encoded.pixel_values, dtype=jnp.bfloat16),
+          vision_grid=encoded.vision_grid,
+          padding_mask=jnp.array(encoded.input_mask).astype(jnp.bool_),
+          completion_mask=jnp.array(encoded.completion_mask),
+          advantages=advantages,
+      )
     logger.info('[step %d] loss=%.4f', step, float(loss))
 
     # Save checkpoint at the configured cadence.

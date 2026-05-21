@@ -389,6 +389,7 @@ class Qwen3VLSampler:
       eos_tokens: Sequence[int] | None = None,
       forbidden_tokens: Sequence[int] | None = None,
       seed: int = 0,
+      forced_prompt_length: int | None = None,
   ):
     """Generate and return both decoded strings and raw token arrays.
 
@@ -399,6 +400,13 @@ class Qwen3VLSampler:
           trimmed at the first EOS and stripped of pad tokens
       token_buffer: np.ndarray [B, total_steps] — full buffer (prompt + gen)
       prompt_seq_len: int             — left-padded prompt length L_prompt
+
+    If ``forced_prompt_length`` is set, every prompt is padded to exactly
+    that length. This is required for multi-host SPMD: without it, each
+    JAX process derives its own prompt length from its local data shard
+    and compiles a different decode graph, producing "different launch id"
+    silent deaths after ~1-10 min. Set to a value large enough to cover
+    every prompt + image-pad token count in the batch.
     """
     if isinstance(prompts, str):
       prompts = [prompts]
@@ -415,16 +423,29 @@ class Qwen3VLSampler:
         if images is not None
         else [[] for _ in prompts]
     )
-    batch = encode_batch(
-        self._processor,
-        list(prompts),
-        image_lists,
+    encode_kwargs = dict(
         vcfg=self._config.vision_config,
-        max_length=self._cache_size,
         truncation=False,
         pad_to_multiple_of=128,
         padding_side='left',
     )
+    if forced_prompt_length is not None:
+      batch = encode_batch(
+          self._processor,
+          list(prompts),
+          image_lists,
+          max_length=forced_prompt_length,
+          padding='max_length',
+          **encode_kwargs,
+      )
+    else:
+      batch = encode_batch(
+          self._processor,
+          list(prompts),
+          image_lists,
+          max_length=self._cache_size,
+          **encode_kwargs,
+      )
 
     seq_len = batch.input_tokens.shape[1]
     total_sampling_steps = seq_len + max_new_tokens

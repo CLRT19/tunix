@@ -132,6 +132,10 @@ class Qwen3VLVanillaRollout(base_rollout.BaseRollout):
         top_k=top_k,
         eos_tokens=rollout_config.eos_tokens,
         seed=seed_int,
+        # Multi-host SPMD requires every process to compile the same
+        # decode graph; passing a forced length pads all prompts to the
+        # same multiple-of-128 boundary regardless of local data shard.
+        forced_prompt_length=rollout_config.max_prompt_length,
     )
 
     target_prompt_len = rollout_config.max_prompt_length
