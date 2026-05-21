@@ -70,24 +70,51 @@ logger = logging.getLogger(__name__)
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-MODEL_ID = 'Qwen/Qwen3-VL-4B-Instruct'
+MODEL_ID = os.environ.get('QWEN3VL_MODEL_DIR', 'Qwen/Qwen3-VL-4B-Instruct')
 
-BATCH_SIZE = 1
-MAX_SEQ_LEN = 2048
+BATCH_SIZE = int(os.environ.get('QWEN3VL_BATCH_SIZE', '1'))
+MAX_SEQ_LEN = int(os.environ.get('QWEN3VL_MAX_SEQ_LEN', '2048'))
 # Vision encoder does full self-attention over all patches before spatial
 # merging.  At patch_size=16, large images produce many patches and the
 # float32 attention-score matrix [n_heads, n, n] can exhaust HBM.
 # 1280 px → 80×80 = 6400 patches → [16, 6400, 6400] float32 ≈ 2.6 GiB.
-MAX_IMAGE_SIZE = 1280
+MAX_IMAGE_SIZE = int(os.environ.get('QWEN3VL_MAX_IMAGE_SIZE', '1280'))
 
-USE_QUANTIZATION = False  # True -> QLoRA, False -> LoRA
-LORA_RANK = 16
-LORA_ALPHA = float(2 * LORA_RANK)
+USE_QUANTIZATION = os.environ.get('QWEN3VL_QUANTIZATION', '0') == '1'
+LORA_RANK = int(os.environ.get('QWEN3VL_LORA_RANK', '16'))
+LORA_ALPHA = float(os.environ.get('QWEN3VL_LORA_ALPHA', str(2 * LORA_RANK)))
 
-MAX_STEPS = 100
-EVAL_EVERY_N_STEPS = 20
+MAX_STEPS = int(os.environ.get('QWEN3VL_MAX_STEPS', '100'))
+EVAL_EVERY_N_STEPS = int(os.environ.get('QWEN3VL_EVAL_EVERY_N_STEPS', '20'))
 
-LORA_CKPT_DIR = '/tmp/qwen3vl_lora_ckpts'
+LORA_CKPT_DIR = os.environ.get('QWEN3VL_CKPT_DIR', '/tmp/qwen3vl_lora_ckpts')
+TENSORBOARD_DIR = os.environ.get(
+    'QWEN3VL_TENSORBOARD_DIR', '/tmp/tensorboard/qwen3vl_lora'
+)
+# Mesh "(fsdp,tp)". Default (1,1) keeps the original single-host behavior.
+MESH_SHAPE = tuple(
+    int(x) for x in os.environ.get('QWEN3VL_MESH_SHAPE', '1,1').split(',')
+)
+
+
+def _maybe_initialize_jax_distributed():
+  """Init JAX distributed when launched on a multi-host TPU slice."""
+  if os.environ.get('TUNIX_JAX_DISTRIBUTED_AUTO_INIT', '').lower() not in (
+      '1',
+      'true',
+      'yes',
+      'on',
+  ):
+    return
+  if jax.distributed.is_initialized():
+    return
+  timeout_seconds = int(
+      os.environ.get('TUNIX_JAX_DISTRIBUTED_INIT_TIMEOUT_SECONDS', '300')
+  )
+  logger.info(
+      'Initializing JAX distributed runtime with automatic cluster detection.'
+  )
+  jax.distributed.initialize(initialization_timeout=timeout_seconds)
 
 # ---------------------------------------------------------------------------
 # Model ID / directory resolution
@@ -188,13 +215,19 @@ def create_datasets(
 
   ops = [_PrepareConversation()]
 
+  # Shard the dataset across JAX processes when running multi-host.
+  if jax.process_count() > 1:
+    shard_options = grain.ShardByJaxProcess(drop_remainder=True)
+  else:
+    shard_options = grain.NoSharding()
+
   def _make_loader(hf_split, num_epochs):
     grain_loader = grain.DataLoader(
         data_source=hf_split,
         sampler=grain.IndexSampler(
             num_records=len(hf_split),
             num_epochs=num_epochs,
-            shard_options=grain.NoSharding(),
+            shard_options=shard_options,
         ),
         operations=ops,
         # worker_count=0: keep single-threaded; AutoProcessor is not fork-safe.
@@ -355,17 +388,26 @@ def _generate_sample(
 
 
 def main():
+  _maybe_initialize_jax_distributed()
   jax.config.update('jax_explain_cache_misses', True)
   jax.config.update('jax_compilation_cache_dir', '/tmp/jax_cache')
-  os.makedirs(LORA_CKPT_DIR, exist_ok=True)
+  is_primary = jax.process_index() == 0
+  if is_primary:
+    os.makedirs(LORA_CKPT_DIR, exist_ok=True)
 
   # --- Load model ---
   config = model_lib.ModelConfig.qwen3vl_4b()
   config.remat_config = model_lib.RematConfig.BLOCK
   model_dir = resolve_model_dir(MODEL_ID)
 
-  logger.info('Loading model from %s', model_dir)
-  mesh = jax.make_mesh((1, 1), ('fsdp', 'tp'))
+  logger.info(
+      'Loading model from %s on mesh %s (process %d/%d)',
+      model_dir,
+      MESH_SHAPE,
+      jax.process_index(),
+      jax.process_count(),
+  )
+  mesh = jax.make_mesh(MESH_SHAPE, ('fsdp', 'tp'))
   base_model = params_lib.create_model_from_safe_tensors(
       model_dir, config, mesh=mesh, dtype=jnp.bfloat16
   )
@@ -383,23 +425,35 @@ def main():
   show_hbm_usage()
 
   # --- Pick a fixed eval sample for before/after comparison ---
-  hf_eval = datasets.load_dataset(
-      'HuggingFaceM4/DocumentVQA', split='validation'
-  )
-  sample_item = hf_eval[0]
-  sample_image = sample_item['image'].convert('RGB')
-  sample_image.thumbnail((SAMPLE_MAX_IMAGE_SIZE, SAMPLE_MAX_IMAGE_SIZE))
-  sample_question = sample_item['question']
-  sample_answer = sample_item['answers'][0]
+  # Only the primary process drives sample generation to avoid all-process
+  # decode passes; everyone still participates in the JIT/decode collective.
+  sample_image = None
+  sample_question = None
+  sample_answer = None
+  if is_primary:
+    hf_eval = datasets.load_dataset(
+        'HuggingFaceM4/DocumentVQA', split='validation'
+    )
+    sample_item = hf_eval[0]
+    sample_image = sample_item['image'].convert('RGB')
+    sample_image.thumbnail((SAMPLE_MAX_IMAGE_SIZE, SAMPLE_MAX_IMAGE_SIZE))
+    sample_question = sample_item['question']
+    sample_answer = sample_item['answers'][0]
+    logger.info('Sample question: %s', sample_question)
+    logger.info('Ground truth:    %s', sample_answer)
 
-  logger.info('Sample question: %s', sample_question)
-  logger.info('Ground truth:    %s', sample_answer)
-  before = _generate_sample(
-      lora_model, processor, sample_image, sample_question
-  )
-  logger.info(
-      'Before training: \n\tquestion: %s\n\tanswer: %s', sample_question, before
-  )
+  # Skip the before/after generation in multi-host runs for now: the sampler
+  # uses jax.lax.while_loop + KV cache and requires careful all-process
+  # coordination to match the training mesh.  Single-host smoke still runs it.
+  if jax.process_count() == 1 and sample_image is not None:
+    before = _generate_sample(
+        lora_model, processor, sample_image, sample_question
+    )
+    logger.info(
+        'Before training: \n\tquestion: %s\n\tanswer: %s',
+        sample_question,
+        before,
+    )
 
   # --- Data ---
   logger.info('Building DocumentVQA datasets (max_seq_len=%d)', MAX_SEQ_LEN)
@@ -409,7 +463,7 @@ def main():
 
   # --- Trainer ---
   logging_options = metrics_logger.MetricsLoggerOptions(
-      log_dir='/tmp/tensorboard/qwen3vl_lora',
+      log_dir=TENSORBOARD_DIR,
       flush_every_n_steps=EVAL_EVERY_N_STEPS,
   )
   training_config = peft_trainer.TrainingConfig(
@@ -431,11 +485,16 @@ def main():
     trainer.train(train_ds, eval_ds=None)
   logger.info('Training complete. Checkpoints saved to %s', LORA_CKPT_DIR)
 
-  # --- Sample after training ---
-  after = _generate_sample(lora_model, processor, sample_image, sample_question)
-  logger.info(
-      'Before training: \n\tquestion: %s\n\tanswer: %s', sample_question, after
-  )
+  # --- Sample after training (single-host only; see note above) ---
+  if jax.process_count() == 1 and sample_image is not None:
+    after = _generate_sample(
+        lora_model, processor, sample_image, sample_question
+    )
+    logger.info(
+        'After training: \n\tquestion: %s\n\tanswer: %s',
+        sample_question,
+        after,
+    )
 
 
 if __name__ == '__main__' and '__file__' in globals():
