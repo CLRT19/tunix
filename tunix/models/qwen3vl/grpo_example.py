@@ -452,6 +452,12 @@ def main():
             os.environ.get('QWEN3VL_VLLM_HBM', '0.3')
         ),
         rollout_vllm_max_num_seqs=NUM_PROMPTS * NUM_GENERATIONS,
+        # Must be >= the per-image multimodal token budget (vLLM rejects engine
+        # init otherwise: "max_tokens_per_mm_item > max_num_batched_tokens").
+        # Qwen3-VL images expand to up to ~16k tokens.
+        rollout_vllm_max_num_batched_tokens=int(
+            os.environ.get('QWEN3VL_VLLM_MAX_BATCHED_TOKENS', '16384')
+        ),
     )
     logger.info(
         '[rollout] engine=vllm tp=%d dp=%d hbm_util=%s model_dir=%s',
