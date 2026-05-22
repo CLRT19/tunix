@@ -95,6 +95,9 @@ ROLLOUT_PROMPT_LEN = int(os.environ.get('QWEN3VL_ROLLOUT_PROMPT_LEN', '768'))
 MAX_IMAGE_SIZE = int(os.environ.get('QWEN3VL_MAX_IMAGE_SIZE', '512'))
 
 LEARNING_RATE = float(os.environ.get('QWEN3VL_LR', '1e-6'))
+# Global-norm gradient clip. 0 disables. A small clip (~1.0) keeps the
+# overfit curve from overshooting into divergence once advantages spike.
+GRAD_CLIP = float(os.environ.get('QWEN3VL_GRAD_CLIP', '0'))
 MAX_STEPS = int(os.environ.get('QWEN3VL_MAX_STEPS', '4'))
 CKPT_EVERY_N_STEPS = int(os.environ.get('QWEN3VL_CKPT_EVERY_N_STEPS', '2'))
 
@@ -152,11 +155,16 @@ class _PrepareChartQA(grain.MapTransform):
 
 def create_dataset() -> grain.DataLoader:
   hf_ds = datasets.load_dataset(DATASET_ID, split=DATASET_SPLIT)
-  shard_options = (
-      grain.ShardByJaxProcess(drop_remainder=True)
-      if jax.process_count() > 1
-      else grain.NoSharding()
-  )
+  # In overfit mode every host must train on the *same* fixed prompts so
+  # the per-host gradients reinforce instead of fighting (the multi-host
+  # different-prompt-per-host interference that caused the step-5 reward
+  # collapse). NoSharding makes all processes iterate the identical
+  # sequence, so each captures the same fixed_batch. The forced prompt
+  # length + fixed image resize already keep shapes SPMD-uniform.
+  if OVERFIT or jax.process_count() == 1:
+    shard_options = grain.NoSharding()
+  else:
+    shard_options = grain.ShardByJaxProcess(drop_remainder=True)
   return grain.DataLoader(
       data_source=hf_ds,
       sampler=grain.IndexSampler(
@@ -431,10 +439,15 @@ def main():
   )
 
   # --- Optimizer (constructed and sharded inside the mesh) ---
+  tx = optax.adamw(LEARNING_RATE)
+  if GRAD_CLIP > 0:
+    # Clip first, then adam — bounds the per-step update so a reward spike
+    # can't kick the policy into divergence (the step-5 overfit collapse).
+    tx = optax.chain(optax.clip_by_global_norm(GRAD_CLIP), tx)
+    logger.info('[optim] grad clip_by_global_norm=%.3g, lr=%.3g',
+                GRAD_CLIP, LEARNING_RATE)
   with mesh:
-    optimizer = nnx.Optimizer(
-        model, optax.adamw(LEARNING_RATE), wrt=nnx.Param
-    )
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     _shard_optimizer_state(optimizer, mesh)
 
   # --- Dataset ---
