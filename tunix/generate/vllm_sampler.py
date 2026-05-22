@@ -410,9 +410,20 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       return_logits: bool = True,
       echo: bool = False,
       pad_output: bool = False,
+      images: Any = None,
       **kwargs,
   ) -> base_sampler.SamplerOutput:
-    """The entry point API for vLLM Sampler"""
+    """The entry point API for vLLM Sampler.
+
+    Args:
+      images: Optional list of per-prompt multimodal inputs (e.g. PIL images),
+        one entry per ``input_strings``. When provided, each prompt is handed to
+        vLLM as raw text + image so vLLM's own processor tokenizes the text and
+        expands the image placeholder tokens to match the image grid; the
+        returned ``padded_prompt_tokens`` then reflect vLLM's expanded prompt.
+        ``None`` (default) keeps the original text-only pre-tokenized path
+        unchanged.
+    """
     if isinstance(input_strings, str):
       input_strings = [input_strings]
 
@@ -490,7 +501,23 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       self.sampling_params = sampling_params
 
     prompt_ids = [self.tokenize(x) for x in input_strings]
-    prompt_objects = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_ids]
+    if images is None:
+      prompt_objects = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_ids]
+    else:
+      # Multimodal: hand vLLM the raw text + image so its processor tokenizes
+      # the text AND expands the image placeholder tokens to match the image
+      # grid. Pre-tokenized ids (the text-only path above) would miss those
+      # expanded image pads. Mirrors the verified offline driver request shape
+      # {"prompt": str, "multi_modal_data": {"image": pil}}.
+      if len(images) != len(input_strings):
+        raise ValueError(
+            f"Number of images ({len(images)}) must match number of prompts "
+            f"({len(input_strings)})."
+        )
+      prompt_objects = [
+          {"prompt": s, "multi_modal_data": {"image": img}}
+          for s, img in zip(input_strings, images)
+      ]
     if self._driver is not None:
       outputs = self._generate_server_mode(prompt_objects, self.sampling_params)
     else:
@@ -502,6 +529,12 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
     decoded_outputs, out_logprobs, out_tokens = self.detokenize(
         input_strings, outputs
     )
+
+    if images is not None:
+      # vLLM expanded the image placeholders, so the local text-only
+      # tokenization undercounts the prompt. Use the actual prompt token ids
+      # vLLM consumed so the returned left-padded prompt tokens are correct.
+      prompt_ids = [list(o.prompt_token_ids) for o in outputs]
 
     max_tokens_length = max(len(x) for x in prompt_ids)
 

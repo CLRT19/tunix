@@ -78,10 +78,26 @@ class VllmRollout(base_rollout.BaseRollout):
     )
     state = nnx.state(model)
     self._sampler.load_checkpoint(state)
+    self._pending_images = None
 
   @property
   def mesh(self) -> jax.sharding.Mesh:
     return self._sampler.mesh
+
+  def set_pending_images(self, images) -> None:
+    """Stage per-prompt multimodal inputs for the next generate() call.
+
+    Mirrors ``Qwen3VLVanillaRollout``: ``rl_cluster.generate`` forwards only
+    ``prompts``, so multimodal inputs (e.g. PIL images, one per prompt) are
+    staged here by the launcher/dataset pipe before ``generate`` runs. Pass
+    ``None`` for a text-only batch.
+    """
+    self._pending_images = images
+
+  def consume_pending_images(self):
+    images = self._pending_images
+    self._pending_images = None
+    return images
 
   def generate(
       self,
@@ -91,6 +107,14 @@ class VllmRollout(base_rollout.BaseRollout):
   ) -> base_rollout.RolloutOutput:
     """Generates samples from the model."""
     sampling_kwargs = dict(kwargs)
+    images = sampling_kwargs.pop("images", None)
+    if images is None:
+      images = self.consume_pending_images()
+    if images is not None and len(images) != len(prompts):
+      raise ValueError(
+          f"Number of images ({len(images)}) must match number of prompts "
+          f"({len(prompts)})."
+      )
     if rollout_config.eos_tokens is not None:
       sampling_kwargs["stop_token_ids"] = rollout_config.eos_tokens
 
@@ -104,6 +128,7 @@ class VllmRollout(base_rollout.BaseRollout):
         seed=rollout_config.seed,
         echo=False,
         pad_output=True,
+        images=list(images) if images is not None else None,
         **sampling_kwargs,
     )
 
