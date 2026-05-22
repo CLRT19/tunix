@@ -14,7 +14,13 @@
 
 """Qwen3-VL API."""
 
+from tunix.models.qwen3vl import mapping_vllm_jax
 from tunix.models.qwen3vl import model
 from tunix.models.qwen3vl import params
 
-__all__ = ['model', 'params']
+BACKEND_MAPPINGS = {
+    'vllm_jax': mapping_vllm_jax.VLLM_JAX_MAPPING,
+}
+
+
+__all__ = ['BACKEND_MAPPINGS', 'model', 'params']
