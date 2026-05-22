@@ -435,8 +435,14 @@ def main():
     # from the model's BackendMappingMixin) + caller-side allgather in
     # VllmRollout.update_params. NOTE: needs on-hardware validation.
     from tunix.rl.rollout import vllm_rollout  # local import: jax-0.9.2 env only
+    # In-process vLLM: each host runs an INDEPENDENT TP=tp engine on its LOCAL
+    # chips; data-parallelism across hosts comes from the 8 separate JAX
+    # processes, NOT vLLM DP. So dp=1 + local device ids — otherwise the TPU
+    # worker is handed a global device index it doesn't own (KeyError in
+    # tpu_worker.init_device). Mirrors the vanilla per-host replicated rollout.
+    os.environ.setdefault('TUNIX_VLLM_USE_LOCAL_TPU_DEVICE_IDS', '1')
     tp = MESH_SHAPE[1] if len(MESH_SHAPE) > 1 else 1
-    dp = max(1, jax.device_count() // tp)
+    dp = int(os.environ.get('QWEN3VL_VLLM_DP', '1'))
     vllm_rollout_config = base_rollout.RolloutConfig(
         max_tokens_to_generate=MAX_NEW_TOKENS,
         max_prompt_length=ROLLOUT_PROMPT_LEN,
