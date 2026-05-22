@@ -18,10 +18,28 @@ from typing import Any, Dict, Optional, Tuple
 
 from flax import nnx
 import jax
+from jax.experimental import multihost_utils
 import jaxtyping
 from tunix.generate import mappings
 from tunix.generate import vllm_sampler
 from tunix.rl.rollout import base_rollout
+
+
+def _gather_non_addressable_leaf(value: Any) -> Any:
+  """Fully replicate a global jax.Array before the mapped vLLM resharding.
+
+  The trainer actor params are FSDP-sharded across hosts (not fully
+  addressable). ``transfer_state_with_mappings`` reshards to the vLLM target
+  sharding but never gathers, so non-addressable leaves must be all-gathered
+  first. No-op for already-addressable arrays (single-host / replicated).
+  """
+  if isinstance(value, jax.Array) and not value.is_fully_addressable:
+    return multihost_utils.process_allgather(value, tiled=True)
+  return value
+
+
+def _gather_non_addressable_params(params: jaxtyping.PyTree) -> jaxtyping.PyTree:
+  return jax.tree.map(_gather_non_addressable_leaf, params)
 
 
 class VllmRollout(base_rollout.BaseRollout):
@@ -156,6 +174,10 @@ class VllmRollout(base_rollout.BaseRollout):
       params: jaxtyping.PyTree,
       filter_types: Optional[Tuple[Any, ...]] = None,
   ) -> None:
+    # Gather FSDP-sharded actor params to fully-replicated before the mapped
+    # sync (transfer_state_with_mappings reshards but never gathers). No-op
+    # when params are already addressable.
+    params = _gather_non_addressable_params(params)
     self._sampler.update_params(params, filter_types)
 
   def pad_id(self) -> int:

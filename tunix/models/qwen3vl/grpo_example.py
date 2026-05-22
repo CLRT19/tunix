@@ -77,6 +77,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MODEL_ID = os.environ.get('QWEN3VL_MODEL_DIR', 'Qwen/Qwen3-VL-4B-Instruct')
+# Model size selects the tunix ModelConfig preset (qwen3vl_4b / qwen3vl_8b); it
+# MUST match the weights at QWEN3VL_MODEL_DIR. 8B is untied (has lm_head); 4B is tied.
+MODEL_SIZE = os.environ.get('QWEN3VL_MODEL_SIZE', '4b').lower()
+# Rollout engine: 'vanilla' (proven pure-JAX sampler, default) or 'vllm'
+# (in-process vLLM, jax 0.9.2 env). Vanilla stays the fallback.
+ROLLOUT_ENGINE = os.environ.get('QWEN3VL_ROLLOUT_ENGINE', 'vanilla').lower()
 DATASET_ID = os.environ.get('QWEN3VL_DATASET', 'HuggingFaceM4/ChartQA')
 DATASET_SPLIT = os.environ.get('QWEN3VL_DATASET_SPLIT', 'train')
 
@@ -349,7 +355,8 @@ def main():
     os.makedirs(CKPT_DIR, exist_ok=True)
 
   # --- Mesh + model ---
-  config = model_lib.ModelConfig.qwen3vl_4b()
+  config = getattr(model_lib.ModelConfig, f'qwen3vl_{MODEL_SIZE}')()
+  logger.info('[model] size=%s (from QWEN3VL_MODEL_SIZE)', MODEL_SIZE)
   # nnx.remat conflicts with the sampler's jax.lax.while_loop (decode loop):
   # the inner forward pass mutates Param state at a different trace level
   # inside the while_loop body and raises TraceContextError. The SFT path
@@ -408,26 +415,6 @@ def main():
   processor = load_processor(model_dir)
 
   # --- Rollout adapter ---
-  # Rollout is intentionally local/replicated. The Qwen3-VL multimodal prefill
-  # path dynamically scatters vision embeddings into hidden states; doing that
-  # with the actor's hidden dim sharded over tp corrupts image tokens on TPU.
-  # Keep the train actor sharded, but generate independently on each host.
-  rollout_mesh = _make_local_rollout_mesh()
-  logger.info(
-      'Loading local replicated rollout copy on %s (proc %d)',
-      jax.local_devices()[0],
-      jax.process_index(),
-  )
-  rollout_model = params_lib.create_model_from_safe_tensors(
-      model_dir, config, mesh=rollout_mesh, dtype=jnp.bfloat16
-  )
-  rollout = qwen3vl_vanilla_rollout.Qwen3VLVanillaRollout(
-      model=rollout_model,
-      processor=processor,
-      cache_config_or_size=ROLLOUT_CACHE_SIZE,
-  )
-  if RESUME_FROM:
-    rollout.sync_from_actor(nnx.state(model, nnx.Param))
   _temp = float(os.environ.get('QWEN3VL_TEMPERATURE', '1.0'))
   _top_p_env = os.environ.get('QWEN3VL_TOP_P', '0.95')
   _top_p = None if _top_p_env in ('', 'none', 'None') else float(_top_p_env)
@@ -437,6 +424,67 @@ def main():
       temperature=_temp,
       top_p=_top_p,
   )
+
+  if ROLLOUT_ENGINE == 'vllm':
+    # In-process vLLM rollout (jax 0.9.2 env). vLLM loads its own copy of the
+    # model from model_dir and colocates on the trainer mesh. A v5p-64 (32
+    # chips) maps naturally to DP=hosts x TP=chips-per-host, which also yields
+    # the per-host *replicated* generation the multimodal prefill path needs.
+    # Set DP/mesh explicitly (tunix would otherwise infer dp from tp). The
+    # actor->vLLM weight sync uses the qwen3vl vllm_jax mapping (auto-resolved
+    # from the model's BackendMappingMixin) + caller-side allgather in
+    # VllmRollout.update_params. NOTE: needs on-hardware validation.
+    from tunix.rl.rollout import vllm_rollout  # local import: jax-0.9.2 env only
+    tp = MESH_SHAPE[1] if len(MESH_SHAPE) > 1 else 1
+    dp = max(1, jax.device_count() // tp)
+    vllm_rollout_config = base_rollout.RolloutConfig(
+        max_tokens_to_generate=MAX_NEW_TOKENS,
+        max_prompt_length=ROLLOUT_PROMPT_LEN,
+        temperature=_temp,
+        top_p=_top_p,
+        tensor_parallel_size=tp,
+        data_parallel_size=dp,
+        rollout_vllm_model_version=model_dir,
+        rollout_vllm_hf_config_path=model_dir,
+        rollout_vllm_tpu_backend_type='jax',
+        rollout_vllm_init_with_random_weights=True,
+        rollout_vllm_hbm_utilization=float(
+            os.environ.get('QWEN3VL_VLLM_HBM', '0.3')
+        ),
+        rollout_vllm_max_num_seqs=NUM_PROMPTS * NUM_GENERATIONS,
+    )
+    logger.info(
+        '[rollout] engine=vllm tp=%d dp=%d hbm_util=%s model_dir=%s',
+        tp, dp, os.environ.get('QWEN3VL_VLLM_HBM', '0.3'), model_dir,
+    )
+    rollout = vllm_rollout.VllmRollout(
+        model,
+        processor.tokenizer,
+        cache_config_or_size=ROLLOUT_CACHE_SIZE,
+        mesh=mesh,
+        rollout_config=vllm_rollout_config,
+    )
+  else:
+    # Vanilla rollout (default). Intentionally local/replicated: the Qwen3-VL
+    # multimodal prefill path scatters vision embeddings into hidden states;
+    # doing that with the actor's hidden dim sharded over tp corrupts image
+    # tokens on TPU. Keep the train actor sharded, generate per-host.
+    rollout_mesh = _make_local_rollout_mesh()
+    logger.info(
+        'Loading local replicated rollout copy on %s (proc %d)',
+        jax.local_devices()[0],
+        jax.process_index(),
+    )
+    rollout_model = params_lib.create_model_from_safe_tensors(
+        model_dir, config, mesh=rollout_mesh, dtype=jnp.bfloat16
+    )
+    rollout = qwen3vl_vanilla_rollout.Qwen3VLVanillaRollout(
+        model=rollout_model,
+        processor=processor,
+        cache_config_or_size=ROLLOUT_CACHE_SIZE,
+    )
+    if RESUME_FROM:
+      rollout.sync_from_actor(nnx.state(model, nnx.Param))
 
   # --- Optimizer (constructed and sharded inside the mesh) ---
   tx = optax.adamw(LEARNING_RATE)

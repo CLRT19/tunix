@@ -10,6 +10,7 @@ Runs in the tunix env (jax 0.10.1), NO TPU needed. Checks:
   D. The patch-embed hook turns the real tunix [C*T*P*P, hidden] kernel into the
      tpu-inference Conv3D kernel shape [T, P, P, C, hidden].
 """
+import os
 import re
 import sys
 
@@ -23,14 +24,16 @@ VJ = BACKEND_MAPPINGS["vllm_jax"]
 MAPPING = VJ["to_hf_mappings"]
 HOOKS = VJ["to_hf_hook_fns"] or {}
 
-cfg = M.ModelConfig.qwen3vl_4b()
+# Validate against either model size; 8B is untied (has lm_head), 4B is tied.
+_SIZE = os.environ.get("QWEN3VL_VALIDATE_SIZE", "4b").lower()
+cfg = getattr(M.ModelConfig, f"qwen3vl_{_SIZE}")()
 cfg.remat_config = M.RematConfig.NONE
 vc = cfg.vision_config
 n_layers = cfg.num_layers
 depth = vc.depth
 n_deep = len(vc.deepstack_visual_indexes)
 tie = getattr(cfg, "use_tied_embedding", False)
-print(f"[cfg] 4B: text_layers={n_layers} vision_depth={depth} "
+print(f"[cfg] {_SIZE}: text_layers={n_layers} vision_depth={depth} "
       f"deepstack={n_deep} tie_embed={tie} "
       f"patch(C={vc.in_channels},T={vc.temporal_patch_size},P={vc.patch_size}) "
       f"vhidden={vc.hidden_size}")
