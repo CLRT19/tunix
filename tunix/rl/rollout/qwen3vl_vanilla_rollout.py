@@ -39,12 +39,24 @@ from typing import Any, Optional, Sequence, Tuple
 
 from flax import nnx
 import jax
+from jax.experimental import multihost_utils
 import jaxtyping
 import numpy as np
 from tunix.models.qwen3vl import sampler as qwen3vl_sampler_lib
 from tunix.rl import reshard
 from tunix.rl import utils
 from tunix.rl.rollout import base_rollout
+
+
+def _gather_non_addressable_leaf(value: Any) -> Any:
+  """Fully replicate a global jax.Array before local rollout resharding."""
+  if isinstance(value, jax.Array) and not value.is_fully_addressable:
+    return multihost_utils.process_allgather(value, tiled=True)
+  return value
+
+
+def _gather_non_addressable_params(params: jaxtyping.PyTree) -> jaxtyping.PyTree:
+  return jax.tree.map(_gather_non_addressable_leaf, params)
 
 
 class Qwen3VLVanillaRollout(base_rollout.BaseRollout):
@@ -180,7 +192,8 @@ class Qwen3VLVanillaRollout(base_rollout.BaseRollout):
   ) -> None:
     if filter_types is not None:
       dst_params = nnx.state(self.model(), filter_types)
-      resharded_params = reshard.reshard_pytree(params, dst_params)
+      gathered_params = _gather_non_addressable_params(params)
+      resharded_params = reshard.reshard_pytree(gathered_params, dst_params)
     else:
       resharded_params = params
     flat_new_params, _ = utils.to_flat_dict(resharded_params)
@@ -210,6 +223,9 @@ class Qwen3VLVanillaRollout(base_rollout.BaseRollout):
         self._sampler._model_state,  # pylint: disable=protected-access
         is_leaf=lambda x: isinstance(x, nnx.Variable),
     )
+
+  def sync_from_actor(self, actor_params: jaxtyping.PyTree) -> None:
+    self.update_params(actor_params, filter_types=nnx.Param)
 
   def pad_id(self) -> int:
     tok = self._processor.tokenizer

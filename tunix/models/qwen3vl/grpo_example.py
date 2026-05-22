@@ -419,7 +419,7 @@ def main():
       cache_config_or_size=ROLLOUT_CACHE_SIZE,
   )
   if RESUME_FROM:
-    rollout.update_params(nnx.state(model, nnx.Param), filter_types=nnx.Param)
+    rollout.sync_from_actor(nnx.state(model, nnx.Param))
   _temp = float(os.environ.get('QWEN3VL_TEMPERATURE', '1.0'))
   _top_p_env = os.environ.get('QWEN3VL_TOP_P', '0.95')
   _top_p = None if _top_p_env in ('', 'none', 'None') else float(_top_p_env)
@@ -592,7 +592,7 @@ def main():
           completion_mask=jnp.array(encoded.completion_mask),
           advantages=advantages,
       )
-    rollout.update_params(nnx.state(model, nnx.Param), filter_types=nnx.Param)
+    rollout.sync_from_actor(nnx.state(model, nnx.Param))
     logger.info('[step %d] loss=%.4f', step, float(loss))
 
     # 7b. Characterize peak HBM after step 1 (rollout + train step both
