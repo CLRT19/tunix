@@ -94,7 +94,11 @@ class VllmRollout(base_rollout.BaseRollout):
             sampling_kwargs=rollout_config.rollout_vllm_sampling_kwargs,
         ),
     )
-    state = nnx.state(model)
+    # Initial actor->vLLM weight push. Gather FSDP-sharded (non-addressable)
+    # params first — load_checkpoint goes straight to the sampler's
+    # update_params (no allgather there), and reshard can't handle a
+    # non-fully-addressable input.
+    state = _gather_non_addressable_params(nnx.state(model))
     self._sampler.load_checkpoint(state)
     self._pending_images = None
 
