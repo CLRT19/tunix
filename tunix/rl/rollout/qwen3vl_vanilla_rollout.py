@@ -193,7 +193,7 @@ class Qwen3VLVanillaRollout(base_rollout.BaseRollout):
           lambda x: x.astype(rollout_precision), flat_new_params
       )
     flat_old_params, tree_def = utils.to_flat_dict(
-        self._sampler._flattened_model_state  # pylint: disable=protected-access
+        self._sampler._model_state  # pylint: disable=protected-access
     )
     merged_params = functools.reduce(
         operator.ior, [flat_old_params, flat_new_params], {}
@@ -203,8 +203,11 @@ class Qwen3VLVanillaRollout(base_rollout.BaseRollout):
         self._sampler._model_graphdef,  # pylint: disable=protected-access
         merged_params,
     )
+    self._sampler._model_state = nnx.variables(  # pylint: disable=protected-access
+        new_model, nnx.Param
+    )
     self._sampler._flattened_model_state = jax.tree.leaves(  # pylint: disable=protected-access
-        nnx.variables(new_model, nnx.Param),
+        self._sampler._model_state,  # pylint: disable=protected-access
         is_leaf=lambda x: isinstance(x, nnx.Variable),
     )
 

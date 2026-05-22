@@ -214,6 +214,14 @@ def _apply_chat_template(processor: AutoProcessor, question: str) -> str:
   )
 
 
+def _make_local_rollout_mesh() -> jax.sharding.Mesh:
+  """Single local-device mesh for per-host rollout generation."""
+  device = jax.local_devices()[0]
+  return jax.sharding.Mesh(
+      np.asarray([device], dtype=object).reshape((1, 1)), ('fsdp', 'tp')
+  )
+
+
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
@@ -392,11 +400,26 @@ def main():
   processor = load_processor(model_dir)
 
   # --- Rollout adapter ---
+  # Rollout is intentionally local/replicated. The Qwen3-VL multimodal prefill
+  # path dynamically scatters vision embeddings into hidden states; doing that
+  # with the actor's hidden dim sharded over tp corrupts image tokens on TPU.
+  # Keep the train actor sharded, but generate independently on each host.
+  rollout_mesh = _make_local_rollout_mesh()
+  logger.info(
+      'Loading local replicated rollout copy on %s (proc %d)',
+      jax.local_devices()[0],
+      jax.process_index(),
+  )
+  rollout_model = params_lib.create_model_from_safe_tensors(
+      model_dir, config, mesh=rollout_mesh, dtype=jnp.bfloat16
+  )
   rollout = qwen3vl_vanilla_rollout.Qwen3VLVanillaRollout(
-      model=model,
+      model=rollout_model,
       processor=processor,
       cache_config_or_size=ROLLOUT_CACHE_SIZE,
   )
+  if RESUME_FROM:
+    rollout.update_params(nnx.state(model, nnx.Param), filter_types=nnx.Param)
   _temp = float(os.environ.get('QWEN3VL_TEMPERATURE', '1.0'))
   _top_p_env = os.environ.get('QWEN3VL_TOP_P', '0.95')
   _top_p = None if _top_p_env in ('', 'none', 'None') else float(_top_p_env)
@@ -569,6 +592,7 @@ def main():
           completion_mask=jnp.array(encoded.completion_mask),
           advantages=advantages,
       )
+    rollout.update_params(nnx.state(model, nnx.Param), filter_types=nnx.Param)
     logger.info('[step %d] loss=%.4f', step, float(loss))
 
     # 7b. Characterize peak HBM after step 1 (rollout + train step both
