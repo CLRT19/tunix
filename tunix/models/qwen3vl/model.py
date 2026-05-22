@@ -975,12 +975,15 @@ class Qwen3VL(BackendMappingMixin, nnx.Module):
       x = jax.vmap(_inject)(x, input_tokens, vision_embeds.tokens)
 
     deepstack = vision_embeds.deepstack if vision_embeds else ()
-    deepstack_indexes = (
-        self.config.vision_config.deepstack_visual_indexes
-        if self.config.vision_config
-        else ()
-    )
-    deepstack_map = dict(zip(deepstack_indexes, deepstack))
+    # `deepstack_visual_indexes` ([8,16,24]) are the VISION-encoder layers the
+    # features are extracted from — NOT text-decoder layers. HF injects the
+    # resulting feature list into the FIRST text decoder layers (0,1,2,...) by
+    # list position: vision extraction at deepstack_visual_indexes
+    # (transformers qwen3_vl modeling_qwen3_vl.py:745), text injection at
+    # `layer_idx in range(len(deepstack_visual_embeds))` (line 862). Keying the
+    # map by [8,16,24] lands the chart features at text layers the model never
+    # reads → image-blind generation.
+    deepstack_map = dict(enumerate(deepstack))
     for i, layer in enumerate(self.layers):
       layer_name = f'layer_{i}'
       layer_cache = cache[layer_name] if cache else None
