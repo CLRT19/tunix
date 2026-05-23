@@ -147,7 +147,11 @@ class VllmRollout(base_rollout.BaseRollout):
         temperature=rollout_config.temperature,
         top_p=rollout_config.top_p,
         top_k=rollout_config.top_k,
-        seed=rollout_config.seed,
+        # The vLLM JAX/TPU backend rejects a per-request seed
+        # (tpu_platform.validate_request). Stochastic sampling at temperature>0
+        # still varies completions across steps via vLLM's own RNG, so GRPO
+        # exploration is preserved.
+        seed=None,
         echo=False,
         pad_output=True,
         images=list(images) if images is not None else None,
