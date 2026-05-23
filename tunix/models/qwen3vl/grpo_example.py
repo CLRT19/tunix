@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 import datasets
@@ -548,10 +549,15 @@ def main():
     # would loop at the same completions forever.
     rollout_config.seed = step
     logger.info('[step %d] rolling out %d completions', step, len(prompt_strs))
+    _t_roll = time.perf_counter()
     rollout_out = rollout.generate(
         prompts=prompt_strs,
         rollout_config=rollout_config,
         images=images,
+    )
+    logger.info(
+        '[step %d] rollout_sec=%.2f (engine=%s, %d completions)',
+        step, time.perf_counter() - _t_roll, ROLLOUT_ENGINE, len(prompt_strs),
     )
 
     # 3b. One-time cluster-wide assertion that every host padded the
