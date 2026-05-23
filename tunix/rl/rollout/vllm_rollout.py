@@ -191,6 +191,14 @@ class VllmRollout(base_rollout.BaseRollout):
     params = _gather_non_addressable_params(params)
     self._sampler.update_params(params, filter_types)
 
+  def sync_from_actor(self, actor_params: jaxtyping.PyTree) -> None:
+    """Push fresh actor weights into the vLLM engine (called each train step).
+
+    Mirrors Qwen3VLVanillaRollout.sync_from_actor so the standalone GRPO loop
+    can drive either engine identically.
+    """
+    self.update_params(actor_params, filter_types=nnx.Param)
+
   def pad_id(self) -> int:
     return self._sampler.tokenizer.pad_id()
 
