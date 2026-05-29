@@ -131,10 +131,33 @@ MESH_SHAPE = tuple(
 
 SYSTEM_PROMPT = os.environ.get(
     'QWEN3VL_SYSTEM_PROMPT',
-    'You are given a chart image and a question about it. Think step by '
-    'step inside <think>...</think> tags, then give only the final answer '
-    'inside <answer>...</answer> tags.',
+    'You are a helpful assistant. Think step by step inside '
+    '<think>...</think>, then provide your final answer inside '
+    '<answer>...</answer>.',
 )
+
+# ---------------------------------------------------------------------------
+# Vero multi-domain (optional). When QWEN3VL_VERO_JSONL is set we switch
+# from the single-domain ChartQA HF dataset path to a JSONL-backed dataset
+# that carries `domain`, `reward_type`, `ground_truth`, and `extra_info`
+# per row, routed through the vero_router reward fn. Empty defaults keep
+# the ChartQA fallback bit-identical for Phase 4+5 runs.
+# ---------------------------------------------------------------------------
+QWEN3VL_VERO_JSONL = os.environ.get('QWEN3VL_VERO_JSONL', '')
+QWEN3VL_VERO_IMAGE_ROOT = os.environ.get('QWEN3VL_VERO_IMAGE_ROOT', '')
+QWEN3VL_VERO_LOCAL_DIR = os.environ.get(
+    'QWEN3VL_VERO_LOCAL_DIR', '/tmp/qwen3vl_vero_smoke'
+)
+QWEN3VL_DOMAINS = [
+    s.strip()
+    for s in os.environ.get('QWEN3VL_DOMAINS', '').split(',')
+    if s.strip()
+] or None
+_mw_raw = os.environ.get('QWEN3VL_MIX_WEIGHTS', '').strip()
+QWEN3VL_MIX_WEIGHTS = (
+    [float(s) for s in _mw_raw.split(',') if s.strip()] if _mw_raw else None
+)
+QWEN3VL_FORMAT_SCORE = float(os.environ.get('QWEN3VL_FORMAT_SCORE', '0.2'))
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +183,25 @@ class _PrepareChartQA(grain.MapTransform):
     }
 
 
-def create_dataset() -> grain.DataLoader:
+def create_dataset():
+  # Vero multi-domain JSONL path takes precedence when configured. Falls
+  # back to the original ChartQA HF dataset path otherwise (Phase 4+5
+  # default — bit-identical to the pre-vero behavior).
+  if QWEN3VL_VERO_JSONL:
+    from tunix.models.qwen3vl import vero_dataset
+    local_jsonl, local_img_root = vero_dataset.download_smoke_assets(
+        QWEN3VL_VERO_JSONL,
+        QWEN3VL_VERO_IMAGE_ROOT,
+        QWEN3VL_VERO_LOCAL_DIR,
+    )
+    return vero_dataset.build_vero_jsonl_dataset(
+        local_jsonl,
+        local_img_root,
+        MAX_IMAGE_SIZE,
+        QWEN3VL_DOMAINS,
+        QWEN3VL_MIX_WEIGHTS,
+        shuffle_seed=0,
+    )
   hf_ds = datasets.load_dataset(DATASET_ID, split=DATASET_SPLIT)
   # In overfit mode every host must train on the *same* fixed prompts so
   # the per-host gradients reinforce instead of fighting (the multi-host
@@ -355,6 +396,26 @@ def main():
   if is_primary:
     os.makedirs(CKPT_DIR, exist_ok=True)
 
+  # Active dataset banner. Make the vero vs chartqa choice loud at start
+  # so it's obvious in the launcher log which path the run is on.
+  if QWEN3VL_VERO_JSONL:
+    logger.info(
+        '[dataset] mode=vero jsonl=%s image_root=%s local_dir=%s'
+        ' domains_filter=%s mix_weights=%s format_score=%.3f',
+        QWEN3VL_VERO_JSONL,
+        QWEN3VL_VERO_IMAGE_ROOT,
+        QWEN3VL_VERO_LOCAL_DIR,
+        QWEN3VL_DOMAINS,
+        QWEN3VL_MIX_WEIGHTS,
+        QWEN3VL_FORMAT_SCORE,
+    )
+  else:
+    logger.info(
+        '[dataset] mode=chartqa dataset_id=%s split=%s',
+        DATASET_ID,
+        DATASET_SPLIT,
+    )
+
   # --- Mesh + model ---
   config = getattr(model_lib.ModelConfig, f'qwen3vl_{MODEL_SIZE}')()
   logger.info('[model] size=%s (from QWEN3VL_MODEL_SIZE)', MODEL_SIZE)
@@ -541,7 +602,27 @@ def main():
     # 2. Tile to NUM_GENERATIONS per prompt.
     questions = [b['question'] for b in batch for _ in range(NUM_GENERATIONS)]
     images = [b['image'] for b in batch for _ in range(NUM_GENERATIONS)]
-    labels = [b['label'] for b in batch for _ in range(NUM_GENERATIONS)]
+    if QWEN3VL_VERO_JSONL:
+      # Vero JSONL rows carry `ground_truth` + domain/reward_type/extra_info.
+      # Tile each by NUM_GENERATIONS, same fan-out pattern as questions/images,
+      # so per-completion indices stay aligned.
+      ground_truths = [
+          b['ground_truth'] for b in batch for _ in range(NUM_GENERATIONS)
+      ]
+      domains = [b['domain'] for b in batch for _ in range(NUM_GENERATIONS)]
+      reward_types = [
+          b['reward_type'] for b in batch for _ in range(NUM_GENERATIONS)
+      ]
+      extra_infos = [
+          b['extra_info'] for b in batch for _ in range(NUM_GENERATIONS)
+      ]
+      labels = None  # ChartQA-only field; not used on the vero path.
+    else:
+      labels = [b['label'] for b in batch for _ in range(NUM_GENERATIONS)]
+      ground_truths = None
+      domains = None
+      reward_types = None
+      extra_infos = None
     prompt_strs = [_apply_chat_template(processor, q) for q in questions]
 
     # 3. Rollout. Vary the seed per step so we actually explore — without
@@ -581,40 +662,101 @@ def main():
           ROLLOUT_PROMPT_LEN,
       )
 
-    # 4. Score. Combine answer-match (1.0) and format-shape (0.1) so the
-    # reward is dense early — getting just <think>...<answer> right gets
-    # 0.1 even if the answer is wrong, which produces nonzero advantages
-    # before the model stumbles onto correct answers.
-    answer_rewards = np.array(
-        chartqa_reward.check_answer(
-            prompts=questions,
-            completions=rollout_out.text,
-            label=labels,
-        ),
-        dtype=np.float32,
-    )
-    format_rewards = np.array(
-        chartqa_reward.check_format(
-            prompts=questions, completions=rollout_out.text
-        ),
-        dtype=np.float32,
-    )
-    rewards = answer_rewards + format_rewards
-
-    # Diagnostic: show what the model actually produced for the first
-    # completion so we can tell empty/truncated/no-format apart.
-    if is_primary:
-      _first = rollout_out.text[0] if rollout_out.text else ''
-      logger.info(
-          '[step %d] completion[0] len=%d label=%r ans_r=%.2f fmt_r=%.2f'
-          ' text=%r',
-          step,
-          len(_first),
-          labels[0],
-          float(answer_rewards[0]),
-          float(format_rewards[0]),
-          _first[:300],
+    # 4. Score. Vero-mode dispatches to the multi-domain reward router and
+    # combines via verl-style `(1 - fs) * acc + fs * fmt`. ChartQA-mode keeps
+    # the additive `answer + format` shape that drove the Phase 4 overfit
+    # curve — touching that convention would change its dynamics.
+    if QWEN3VL_VERO_JSONL:
+      from tunix.cli.reward_fn import vero_format
+      from tunix.cli.reward_fn import vero_router
+      answer_rewards = np.array(
+          vero_router.score_batch(
+              domains,
+              reward_types,
+              ground_truths,
+              rollout_out.text,
+              extra_infos,
+          ),
+          dtype=np.float32,
       )
+      format_rewards = np.array(
+          vero_format.check_format_batch(rollout_out.text),
+          dtype=np.float32,
+      )
+      rewards = (
+          (1.0 - QWEN3VL_FORMAT_SCORE) * answer_rewards
+          + QWEN3VL_FORMAT_SCORE * format_rewards
+      )
+
+      # Per-domain reward stats BEFORE group-relative tile-reduction. Useful
+      # for spotting one domain dominating or collapsing the policy.
+      if is_primary:
+        unique_domains = sorted(set(domains))
+        for d in unique_domains:
+          idx = np.array(
+              [i for i, dd in enumerate(domains) if dd == d], dtype=np.int64
+          )
+          if idx.size == 0:
+            continue
+          dr = rewards[idx]
+          logger.info(
+              '[step %d][domain %s] n=%d reward mean=%.3f std=%.3f'
+              ' min=%.3f max=%.3f',
+              step,
+              d,
+              int(idx.size),
+              float(dr.mean()),
+              float(dr.std()),
+              float(dr.min()),
+              float(dr.max()),
+          )
+
+      # Diagnostic: surface the first completion + its domain/gt.
+      if is_primary:
+        _first = rollout_out.text[0] if rollout_out.text else ''
+        logger.info(
+            '[step %d] completion[0] len=%d domain=%s rt=%s gt=%r'
+            ' acc_r=%.2f fmt_r=%.2f text=%r',
+            step,
+            len(_first),
+            domains[0],
+            reward_types[0],
+            ground_truths[0],
+            float(answer_rewards[0]),
+            float(format_rewards[0]),
+            _first[:300],
+        )
+    else:
+      answer_rewards = np.array(
+          chartqa_reward.check_answer(
+              prompts=questions,
+              completions=rollout_out.text,
+              label=labels,
+          ),
+          dtype=np.float32,
+      )
+      format_rewards = np.array(
+          chartqa_reward.check_format(
+              prompts=questions, completions=rollout_out.text
+          ),
+          dtype=np.float32,
+      )
+      rewards = answer_rewards + format_rewards
+
+      # Diagnostic: show what the model actually produced for the first
+      # completion so we can tell empty/truncated/no-format apart.
+      if is_primary:
+        _first = rollout_out.text[0] if rollout_out.text else ''
+        logger.info(
+            '[step %d] completion[0] len=%d label=%r ans_r=%.2f fmt_r=%.2f'
+            ' text=%r',
+            step,
+            len(_first),
+            labels[0],
+            float(answer_rewards[0]),
+            float(format_rewards[0]),
+            _first[:300],
+        )
 
     # 5. Group-relative advantages: (r - mean) / (std + eps).
     grouped = rewards.reshape(NUM_PROMPTS, NUM_GENERATIONS)
