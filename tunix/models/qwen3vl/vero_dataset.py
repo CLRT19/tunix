@@ -424,34 +424,28 @@ def download_smoke_assets(
   else:
     logger.info('[vero] jsonl already staged at %s', local_jsonl)
 
-  # 2. Referenced images only.
-  rels = _collect_image_paths(local_jsonl)
-  logger.info(
-      '[vero] jsonl references %d unique images; checking local cache', len(rels),
-  )
+  # 2. Images: one recursive copy of the entire image tree. The val 2k
+  # tree is ~25 MB / ~100 files; bulk cp finishes in seconds, whereas the
+  # per-file loop spends ~10 s on gcloud startup per file (16 min for 100
+  # files) and times JAX's coordination barrier out.
+  # Path convention: jsonl 'images[0]' is a path that ALREADY starts with
+  # 'images/' (e.g. 'images/gs1693/...'), so 'gcloud storage cp -r
+  # <gs_root>/images <local_image_root>' produces the doubled
+  # '<local_image_root>/images/gs1693/...' layout the row mapper expects.
   gs_root = gs_image_root.rstrip('/')
-  staged = 0
-  skipped = 0
-  for i, rel in enumerate(rels, start=1):
-    dst_path = os.path.join(local_image_root, rel)
-    if os.path.exists(dst_path):
-      skipped += 1
-      continue
-    os.makedirs(os.path.dirname(dst_path) or local_image_root, exist_ok=True)
-    src = f'{gs_root}/{rel}'
+  src_images = f'{gs_root}/images'
+  marker = os.path.join(local_image_root, '.staged_ok')
+  if os.path.exists(marker):
+    logger.info('[vero] images already staged at %s (marker present)', local_image_root)
+  else:
+    logger.info('[vero] bulk staging %s -> %s', src_images, local_image_root)
     try:
-      _gcloud_cp(src, dst_path, recursive=False)
-      staged += 1
+      _gcloud_cp(src_images, local_image_root, recursive=True)
+      with open(marker, 'w') as f:
+        f.write('ok')
     except subprocess.CalledProcessError as e:
-      logger.warning('[vero] failed to stage %s: %s', src, e)
-    if i % 100 == 0:
-      logger.info(
-          '[vero] progress %d/%d (staged=%d skipped=%d)',
-          i, len(rels), staged, skipped,
-      )
-  logger.info(
-      '[vero] image staging complete: staged=%d skipped=%d total=%d under %s',
-      staged, skipped, len(rels), local_image_root,
-  )
+      logger.warning('[vero] bulk image stage failed: %s', e)
+      raise
+  logger.info('[vero] image staging complete under %s', local_image_root)
 
   return local_jsonl, local_image_root
