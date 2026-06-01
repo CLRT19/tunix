@@ -202,19 +202,36 @@ class _MixWeightedDomainSource:
       )
     if not domains:
       raise ValueError('mix_weights requires at least one domain')
-    self._domains = list(domains)
-    total = float(sum(weights))
+    # Drop domains that have zero rows after filtering — otherwise the
+    # weighted picker can choose an empty bucket and crash. Re-normalize
+    # over the surviving domains. Warn so the user sees which got dropped.
+    _all_rows = {d: list(domain_to_rows.get(d, [])) for d in domains}
+    _empty = [d for d in domains if not _all_rows[d]]
+    if _empty:
+      logger.warning(
+          '[vero] dropping empty domains from mix: %s '
+          '(jsonl has no rows tagged with these abilities)', _empty,
+      )
+    _kept = [(d, w) for d, w in zip(domains, weights) if _all_rows[d]]
+    if not _kept:
+      raise ValueError(
+          'mix_weighted source has zero rows across all requested domains'
+          f' (domains={domains})'
+      )
+    self._domains = [d for d, _ in _kept]
+    _kept_weights = [float(w) for _, w in _kept]
+    total = float(sum(_kept_weights))
     if total <= 0:
       raise ValueError(f'mix_weights must sum to > 0; got {weights}')
-    self._weights = [float(w) / total for w in weights]
+    self._weights = [w / total for w in _kept_weights]
     # Per-domain shuffled index list. Each draw advances a per-domain
     # cursor; we reshuffle when exhausted. Keeps row order stable within
     # a single process for a given seed.
-    self._domain_rows = {d: list(domain_to_rows.get(d, [])) for d in domains}
+    self._domain_rows = {d: _all_rows[d] for d in self._domains}
     self._domain_order: dict[str, list[int]] = {}
     self._domain_cursor: dict[str, int] = {}
     base_rng = random.Random(shuffle_seed)
-    for d in domains:
+    for d in self._domains:
       rng = random.Random(base_rng.randrange(1 << 30))
       order = list(range(len(self._domain_rows[d])))
       rng.shuffle(order)
