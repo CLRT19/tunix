@@ -231,6 +231,9 @@ class _MixWeightedDomainSource:
     # Seeded per-step domain picker. Index passed into __getitem__ is
     # used as an offset so different processes/steps hit different rows.
     self._pick_rng = random.Random(shuffle_seed ^ 0xA5A5)
+    # Salt for per-idx seeding in __getitem__ (random.Random rejects
+    # tuples, so we mix idx + salt into a single int).
+    self._pick_seed_base = self._pick_rng.getrandbits(64)
 
   def __len__(self) -> int:
     return self._total
@@ -253,8 +256,10 @@ class _MixWeightedDomainSource:
 
   def __getitem__(self, idx: int) -> dict[str, Any]:
     # Mix idx into the picker so we don't degenerate to one domain per
-    # epoch under a deterministic IndexSampler.
-    r = random.Random((idx, self._pick_rng.random()))
+    # epoch under a deterministic IndexSampler. random.Random only
+    # accepts None/int/float/str/bytes — combine idx with a salted int.
+    seed = (idx * 0x9E3779B97F4A7C15) ^ self._pick_seed_base
+    r = random.Random(seed & 0xFFFFFFFFFFFFFFFF)
     pick = r.random()
     acc = 0.0
     chosen = self._domains[-1]
