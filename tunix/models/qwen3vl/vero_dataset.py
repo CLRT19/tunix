@@ -45,6 +45,8 @@ The mapper yields the dict shape consumed by the 5-domain reward router:
 
 from __future__ import annotations
 
+import glob
+import io
 import json
 import logging
 import os
@@ -471,3 +473,448 @@ def download_smoke_assets(
   logger.info('[vero] image staging complete under %s', local_image_root)
 
   return local_jsonl, local_image_root
+
+
+# ---------------------------------------------------------------------------
+# Parquet (Vero-600k HF snapshot) support
+# ---------------------------------------------------------------------------
+
+
+def _gcloud_ls(uri: str) -> list[str]:
+  """Return entries under ``uri`` via ``gcloud storage ls``.
+
+  Lines are stripped; trailing empties dropped. Raises on non-zero exit.
+  """
+  out = subprocess.run(
+      ['gcloud', 'storage', 'ls', uri],
+      check=True, capture_output=True, text=True,
+  )
+  return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def _gcloud_du_bytes(uri: str) -> int:
+  """Return the size in bytes of a single object via ``gcloud storage du``.
+
+  ``gcloud storage du`` prints lines of the form ``<bytes> <uri>``; we
+  parse the first column. Returns 0 on parse failure to make picking
+  smallest-first robust against transient ls/du races.
+  """
+  try:
+    out = subprocess.run(
+        ['gcloud', 'storage', 'du', uri],
+        check=True, capture_output=True, text=True,
+    )
+  except subprocess.CalledProcessError:
+    return 0
+  for line in out.stdout.splitlines():
+    parts = line.strip().split()
+    if not parts:
+      continue
+    try:
+      return int(parts[0])
+    except ValueError:
+      continue
+  return 0
+
+
+def stage_parquet_shards(
+    gs_snapshot_root: str,
+    domains_filter: list[str],
+    shards_per_domain: int = 2,
+    local_dir: str = '/tmp/qwen3vl_vero_parquet',
+) -> str:
+  """Stage a small number of train parquet shards per domain from GCS.
+
+  Idempotent. For each ``<domain>-<source>/`` subset directory under
+  ``gs_snapshot_root`` whose ``<domain>`` prefix is in ``domains_filter``,
+  copy up to ``shards_per_domain`` train shards (smallest-first by
+  ``gcloud storage du``) to ``local_dir``. Uses ``gcloud storage cp``
+  (project convention — never ``gsutil``). Writes a ``.staged_ok`` marker
+  at ``local_dir`` on success; re-launches with the marker present skip
+  immediately.
+
+  Args:
+    gs_snapshot_root: ``gs://.../snapshots/<sha>/`` root that holds the
+      ``<domain>-<source>/`` subset directories.
+    domains_filter: List of domain prefixes to keep (e.g.
+      ``['chart_ocr', 'stem']``). Subset dirs whose name does not start
+      with ``<prefix>-`` are skipped.
+    shards_per_domain: Cap on the number of train parquet shards copied
+      per subset directory (smallest-first to keep wall-time bounded).
+    local_dir: Local staging root. Created if missing.
+
+  Returns:
+    ``local_dir`` (absolute or as provided).
+  """
+  os.makedirs(local_dir, exist_ok=True)
+  marker = os.path.join(local_dir, '.staged_ok')
+  if os.path.exists(marker):
+    logger.info(
+        '[vero-parquet] already staged at %s (marker present)', local_dir,
+    )
+    return local_dir
+
+  root = gs_snapshot_root.rstrip('/') + '/'
+  logger.info('[vero-parquet] listing subsets under %s', root)
+  entries = _gcloud_ls(root)
+  # Subsets are directory entries — gcloud ls reports them with a trailing
+  # slash. Filter out non-dir entries (README.md etc.) and any subset whose
+  # leading domain token isn't in domains_filter.
+  prefixes = tuple(f'{d}-' for d in domains_filter)
+  subset_uris: list[str] = []
+  for e in entries:
+    if not e.endswith('/'):
+      continue
+    name = e.rstrip('/').rsplit('/', 1)[-1]
+    if name.startswith(prefixes):
+      subset_uris.append(e)
+  if not subset_uris:
+    raise ValueError(
+        '[vero-parquet] no subset directories matched domains_filter='
+        f'{domains_filter} under {root}'
+    )
+  logger.info(
+      '[vero-parquet] %d subset dirs match domains=%s',
+      len(subset_uris), domains_filter,
+  )
+
+  for subset_uri in subset_uris:
+    subset_name = subset_uri.rstrip('/').rsplit('/', 1)[-1]
+    local_subset = os.path.join(local_dir, subset_name)
+    os.makedirs(local_subset, exist_ok=True)
+    # List all train shards in the subset.
+    shard_uris: list[str] = []
+    for f in _gcloud_ls(subset_uri):
+      base = f.rsplit('/', 1)[-1]
+      if base.startswith('train-') and base.endswith('.parquet'):
+        shard_uris.append(f)
+    if not shard_uris:
+      logger.warning(
+          '[vero-parquet] subset %s has no train-*.parquet — skipping',
+          subset_name,
+      )
+      continue
+    # Pick smallest-first to bound wall-time of the staging step.
+    sized = [(u, _gcloud_du_bytes(u)) for u in shard_uris]
+    sized.sort(key=lambda t: t[1] if t[1] > 0 else 1 << 62)
+    picked = [u for u, _ in sized[:max(1, int(shards_per_domain))]]
+    logger.info(
+        '[vero-parquet] staging %d/%d train shards for %s',
+        len(picked), len(shard_uris), subset_name,
+    )
+    for u in picked:
+      base = u.rsplit('/', 1)[-1]
+      dst = os.path.join(local_subset, base)
+      if os.path.exists(dst) and os.path.getsize(dst) > 0:
+        logger.info('[vero-parquet] %s already present, skipping', base)
+        continue
+      _gcloud_cp(u, dst, recursive=False)
+
+  with open(marker, 'w') as f:
+    f.write('ok')
+  logger.info('[vero-parquet] staging complete under %s', local_dir)
+  return local_dir
+
+
+# Required columns for the parquet -> trainer-row conversion. Reading
+# only what we need avoids pulling the redundant ``extra_info.question``
+# /  ``data_source`` for free.
+_PARQUET_REQUIRED_COLUMNS = (
+    'id',
+    'prompt',
+    'ability',
+    'reward_model',
+    'extra_info',
+    'image',
+)
+
+
+def _extract_question_parquet(prompt: Any) -> str:
+  """Pull the user question from a parquet ``prompt`` struct.
+
+  HF Sequence-of-Struct flattens to ``{'role': [...], 'content': [...]}``
+  with parallel lists. Falls back to the jsonl shape
+  ``[{'role': ..., 'content': ...}]`` if a caller hands us pre-converted
+  data (defensive — keeps the function reusable).
+  """
+  if isinstance(prompt, dict):
+    contents = prompt.get('content') or []
+    if isinstance(contents, list) and contents:
+      first = contents[0]
+      if isinstance(first, str):
+        return _strip_image_token(first)
+      return _strip_image_token(str(first))
+    return ''
+  if isinstance(prompt, list) and prompt:
+    first = prompt[0]
+    if isinstance(first, dict):
+      content = first.get('content', '')
+      if isinstance(content, str):
+        return _strip_image_token(content)
+      if isinstance(content, list):
+        for seg in content:
+          if isinstance(seg, dict) and seg.get('type') == 'text':
+            return _strip_image_token(str(seg.get('text', '')))
+        return ''
+      return _strip_image_token(str(content))
+  return ''
+
+
+def _decode_parquet_image(image_field: Any) -> PIL.Image.Image | None:
+  """Decode a parquet ``image`` struct into a PIL RGB image.
+
+  HF ``Image()`` materializes as ``{'bytes': <binary>, 'path': <str>}``.
+  We prefer inline ``bytes``; if that's missing and ``path`` resolves to
+  a real local file, fall back to opening it. Returns ``None`` on
+  failure so the caller can count + drop the row.
+  """
+  if not isinstance(image_field, dict):
+    return None
+  b = image_field.get('bytes')
+  if b:
+    try:
+      return PIL.Image.open(io.BytesIO(b)).convert('RGB')
+    except Exception as e:  # pylint: disable=broad-except
+      logger.debug('[vero-parquet] PIL decode failed: %s', e)
+      return None
+  p = image_field.get('path')
+  if isinstance(p, str) and p and os.path.exists(p):
+    try:
+      return PIL.Image.open(p).convert('RGB')
+    except Exception as e:  # pylint: disable=broad-except
+      logger.debug('[vero-parquet] PIL open path failed: %s', e)
+      return None
+  return None
+
+
+def _load_parquet_shards(
+    local_parquet_root: str,
+    domains_filter: list[str] | None,
+    max_image_size: int,
+) -> dict[str, list[dict[str, Any]]]:
+  """Read all staged parquet shards into per-domain row lists.
+
+  Each row is *already* in the trainer-side dict shape emitted by
+  ``_PrepareVeroRow.map`` — the parquet path does the decode + resize
+  up front (matches the in-memory loading contract called out in the
+  task description; downstream grain mapper is a no-op pass-through).
+
+  Returns a ``{domain: [row, ...]}`` mapping. Domains absent from the
+  staged data simply yield empty lists (the mix source drops them).
+  """
+  import pyarrow.parquet as pq  # local import: pyarrow is env-specific.
+
+  size = int(max_image_size)
+  domains_set = set(domains_filter) if domains_filter else None
+  domain_to_rows: dict[str, list[dict[str, Any]]] = {}
+  dropped_missing = 0
+  dropped_decode = 0
+
+  # Discover subset dirs matching the domain prefixes.
+  if not os.path.isdir(local_parquet_root):
+    raise ValueError(
+        f'[vero-parquet] local root does not exist: {local_parquet_root}'
+    )
+  subset_names = sorted(os.listdir(local_parquet_root))
+  for subset_name in subset_names:
+    subset_dir = os.path.join(local_parquet_root, subset_name)
+    if not os.path.isdir(subset_dir):
+      continue
+    if '-' not in subset_name:
+      continue
+    domain = subset_name.split('-', 1)[0]
+    if domains_set is not None and domain not in domains_set:
+      continue
+    shard_paths = sorted(glob.glob(os.path.join(subset_dir, 'train-*.parquet')))
+    if not shard_paths:
+      continue
+    for shard_path in shard_paths:
+      try:
+        pf = pq.ParquetFile(shard_path)
+      except Exception as e:  # pylint: disable=broad-except
+        logger.warning(
+            '[vero-parquet] failed to open %s: %s', shard_path, e,
+        )
+        continue
+      # Project columns we actually use to skip the redundant copies.
+      schema_names = set(pf.schema_arrow.names)
+      columns = [c for c in _PARQUET_REQUIRED_COLUMNS if c in schema_names]
+      try:
+        batches = pf.iter_batches(batch_size=128, columns=columns)
+      except Exception:  # pylint: disable=broad-except
+        # Older pyarrow versions don't accept columns kwarg on iter_batches.
+        batches = pf.iter_batches(batch_size=128)
+      for batch in batches:
+        for raw in batch.to_pylist():
+          image_field = raw.get('image')
+          prompt = raw.get('prompt')
+          reward_model = raw.get('reward_model') or {}
+          extra_info = raw.get('extra_info') or {}
+          gt = (
+              reward_model.get('ground_truth', '')
+              if isinstance(reward_model, dict) else ''
+          )
+          question = _extract_question_parquet(prompt)
+          if not question or image_field is None:
+            dropped_missing += 1
+            if dropped_missing == 1:
+              logger.warning(
+                  '[vero-parquet] dropping rows with missing question/image '
+                  '(first occurrence in %s)', shard_path,
+              )
+            continue
+          img = _decode_parquet_image(image_field)
+          if img is None:
+            dropped_decode += 1
+            if dropped_decode == 1:
+              logger.warning(
+                  '[vero-parquet] dropping rows whose image failed to '
+                  'decode (first occurrence in %s)', shard_path,
+              )
+            continue
+          img = img.resize((size, size), PIL.Image.BICUBIC)
+          reward_type = 'string_match'
+          if isinstance(extra_info, dict):
+            rt = extra_info.get('reward_type')
+            if isinstance(rt, str) and rt:
+              reward_type = rt.lower()
+          ability = str(raw.get('ability') or domain)
+          row = {
+              'image': img,
+              'question': question,
+              'ground_truth': _coerce_ground_truth(gt),
+              'domain': ability,
+              'reward_type': reward_type,
+              'extra_info': (
+                  dict(extra_info) if isinstance(extra_info, dict) else {}
+              ),
+          }
+          domain_to_rows.setdefault(ability, []).append(row)
+      logger.info(
+          '[vero-parquet] loaded shard %s (domain=%s, running_total=%d)',
+          os.path.basename(shard_path), domain,
+          len(domain_to_rows.get(domain, [])),
+      )
+
+  if dropped_missing or dropped_decode:
+    logger.warning(
+        '[vero-parquet] dropped %d missing-field rows + %d decode-failure '
+        'rows during load', dropped_missing, dropped_decode,
+    )
+  return domain_to_rows
+
+
+class _PrepareVeroParquetRow(grain.MapTransform):
+  """Pass-through mapper for parquet rows.
+
+  The decode + resize already happened in ``_load_parquet_shards`` so
+  this is a no-op; we still wrap it as a ``MapTransform`` so the grain
+  ``DataLoader.operations`` slot stays non-empty (mirrors the jsonl
+  pipeline shape).
+  """
+
+  def map(self, element: dict[str, Any]) -> dict[str, Any]:
+    return element
+
+
+def build_vero_parquet_dataset(
+    local_parquet_root: str,
+    max_image_size: int,
+    domains_filter: list[str] | None = None,
+    mix_weights: list[float] | None = None,
+    shuffle_seed: int = 0,
+) -> grain.DataLoader:
+  """Build a grain ``DataLoader`` over locally-staged Vero-600k parquet.
+
+  Discovers ``<domain>-<source>/*.parquet`` under ``local_parquet_root``,
+  filters by domain prefix, decodes inline image bytes -> PIL -> RGB ->
+  square-resize(``max_image_size``, BICUBIC), and emits the SAME row
+  dict shape as ``build_vero_jsonl_dataset``:
+
+      {image, question, ground_truth, domain, reward_type, extra_info}
+
+  Uses the existing ``_MixWeightedDomainSource`` / mix-weighted draw
+  pattern: drops empty domains (with a warning) and renormalizes the
+  surviving weights. Shards are read fully into memory at startup (the
+  recommended 1-2 shards per kept domain total ~5-10 GB and fit in host
+  RAM) rather than streamed per row — this keeps the SPMD-friendly
+  ``grain.IndexSampler`` usable on multi-host.
+
+  Args:
+    local_parquet_root: Root directory containing ``<domain>-<source>/``
+      subset dirs full of ``train-*.parquet`` shards (typically the
+      ``stage_parquet_shards`` output dir).
+    max_image_size: Square resize edge length passed to PIL (BICUBIC).
+    domains_filter: If set, drop subsets whose ``<domain>`` prefix is
+      not in this list. Order is preserved for use as ``mix_weights``
+      keys.
+    mix_weights: If set AND aligned with ``domains_filter`` (same
+      length, same order), weighted-sample one domain per draw and then
+      one row within that domain (per-domain shuffled). Otherwise rows
+      are sampled in the natural concatenation order (shuffled per
+      epoch by ``IndexSampler``).
+    shuffle_seed: Seed for per-domain shuffles, the domain picker, and
+      the ``IndexSampler``.
+  """
+  domain_to_rows = _load_parquet_shards(
+      local_parquet_root, domains_filter, max_image_size,
+  )
+  total = sum(len(v) for v in domain_to_rows.values())
+  if total == 0:
+    raise ValueError(
+        '[vero-parquet] no rows loaded under '
+        f'{local_parquet_root} for domains_filter={domains_filter}'
+    )
+
+  use_mix = (
+      mix_weights is not None
+      and domains_filter is not None
+      and len(mix_weights) == len(domains_filter)
+  )
+  if use_mix:
+    # _MixWeightedDomainSource drops empty domains + renormalizes weights.
+    bucketed: dict[str, list[dict[str, Any]]] = {
+        d: domain_to_rows.get(d, []) for d in domains_filter
+    }
+    data_source: Any = _MixWeightedDomainSource(
+        domain_to_rows=bucketed,
+        domains=list(domains_filter),
+        weights=list(mix_weights),
+        shuffle_seed=shuffle_seed,
+    )
+    logger.info(
+        '[vero-parquet] mix-weighted source: domains=%s weights=%s '
+        'total_rows=%d',
+        list(domains_filter), list(mix_weights), len(data_source),
+    )
+  else:
+    flat: list[dict[str, Any]] = []
+    keys = (
+        list(domains_filter)
+        if domains_filter else sorted(domain_to_rows.keys())
+    )
+    for d in keys:
+      flat.extend(domain_to_rows.get(d, []))
+    data_source = _VeroRowSource(flat)
+    logger.info(
+        '[vero-parquet] flat source over %d rows from %s',
+        len(flat), local_parquet_root,
+    )
+
+  if jax.process_count() == 1:
+    shard_options: Any = grain.NoSharding()
+  else:
+    shard_options = grain.ShardByJaxProcess(drop_remainder=True)
+
+  return grain.DataLoader(
+      data_source=data_source,
+      sampler=grain.IndexSampler(
+          num_records=len(data_source),
+          num_epochs=1000,  # effectively infinite for a smoke
+          shard_options=shard_options,
+          shuffle=True,
+          seed=shuffle_seed,
+      ),
+      operations=[_PrepareVeroParquetRow()],
+      worker_count=0,  # PIL / processor fork-safety: keep in-process.
+  )
