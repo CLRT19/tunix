@@ -28,12 +28,15 @@ Flow per step:
   5. Compute group-relative advantages.
   6. Re-tokenize prompt+completion as a multi-turn conversation via
      encode_messages (gives 3D M-RoPE positions and the completion mask).
-  7. JIT grad step on ``-advantages * per_token_logps``, masked to
-     completion tokens.
+  7. ``NUM_ITERATIONS`` JIT grad step(s) on the configured policy loss
+     (``QWEN3VL_LOSS_ALGO``), masked to completion tokens.
 
-Designed for the smoke configuration: ``num_iterations=1``, ``beta=0`` —
-no reference model, no clipping, no KL. We can layer those in once the
-end-to-end loop is green.
+Two policy losses (``QWEN3VL_LOSS_ALGO``):
+  * ``grpo`` (default): single-iteration ``-advantages * per_token_logps``,
+    ``beta=0`` — REINFORCE with group baseline, no reference model / KL / clip.
+  * ``gspo``: GSPO-token (sequence-level, length-normalized importance ratio
+    with PPO clip), matching zlab-princeton/vero. Needs ``NUM_ITERATIONS>=2``
+    to exercise the off-policy clip; the first inner step is on-policy.
 
 Usage::
 
@@ -105,6 +108,40 @@ LEARNING_RATE = float(os.environ.get('QWEN3VL_LR', '1e-6'))
 # Global-norm gradient clip. 0 disables. A small clip (~1.0) keeps the
 # overfit curve from overshooting into divergence once advantages spike.
 GRAD_CLIP = float(os.environ.get('QWEN3VL_GRAD_CLIP', '0'))
+
+# Policy-loss algorithm. "grpo" = the original single-iteration
+# REINFORCE-with-group-baseline loss. "gspo" = GSPO-token (Zheng et al.
+# 2507.18071): a *sequence-level*, length-normalized importance ratio with
+# token-level gradient and PPO-style clipping. GSPO only differs from GRPO
+# once the policy drifts from the rollout (behavior) policy, so it needs
+# NUM_ITERATIONS > 1 — the first inner step is on-policy (ratio == 1) and
+# subsequent steps reuse the same rollout off-policy, where the clip bites.
+# Matches zlab-princeton/vero gspo_llmjudge_shared.yaml:
+#   loss_mode=gspo, clip_ratio_low=3e-4, clip_ratio_high=4e-4,
+#   clip_ratio_c=10.0, use_kl_loss=false, loss_agg_mode=seq-mean-token-mean.
+_loss_algo_raw = os.environ.get('QWEN3VL_LOSS_ALGO', 'grpo').lower()
+if _loss_algo_raw in ('gspo', 'gspo-token'):
+  LOSS_ALGO = 'gspo'  # tunix calls it "gspo-token"; alias to our internal flag.
+elif _loss_algo_raw == 'grpo':
+  LOSS_ALGO = 'grpo'
+else:
+  raise ValueError(
+      "QWEN3VL_LOSS_ALGO must be 'grpo', 'gspo', or 'gspo-token'; got"
+      f' {_loss_algo_raw!r}'
+  )
+# Optimizer steps per rollout (verl ppo_epochs * num_minibatches analogue).
+# 1 keeps the original on-policy behavior; >=2 activates GSPO's off-policy clip.
+NUM_ITERATIONS = int(os.environ.get('QWEN3VL_NUM_ITERATIONS', '1'))
+if NUM_ITERATIONS < 1:
+  raise ValueError(f'QWEN3VL_NUM_ITERATIONS must be >= 1; got {NUM_ITERATIONS}')
+# GSPO clip range. Tiny by design — the sequence-level ratio is a
+# length-normalized geometric mean, so its variance is far smaller than a
+# token-level ratio and the clip must be correspondingly tight.
+CLIP_LOW = float(os.environ.get('QWEN3VL_CLIP_LOW', '3e-4'))
+CLIP_HIGH = float(os.environ.get('QWEN3VL_CLIP_HIGH', '4e-4'))
+# Safety bound on the log importance ratio before exp (verl clip_ratio_c).
+CLIP_C = float(os.environ.get('QWEN3VL_CLIP_C', '10.0'))
+
 MAX_STEPS = int(os.environ.get('QWEN3VL_MAX_STEPS', '4'))
 CKPT_EVERY_N_STEPS = int(os.environ.get('QWEN3VL_CKPT_EVERY_N_STEPS', '2'))
 
@@ -318,21 +355,15 @@ def _make_local_rollout_mesh() -> jax.sharding.Mesh:
 # ---------------------------------------------------------------------------
 
 
-def grpo_loss_fn(
+def _compute_per_token_logps(
     model: model_lib.Qwen3VL,
     input_tokens: jax.Array,  # [B, L]
     positions: jax.Array,  # [3, B, L]
     pixel_values: jax.Array,  # [P, C]
     vision_grid: VisionGridData,
     padding_mask: jax.Array,  # [B, L]
-    completion_mask: jax.Array,  # [B, L] — 1 where loss applies
-    advantages: jax.Array,  # [B]
 ) -> jax.Array:
-  """Advantage-weighted per-token NLL on completion tokens.
-
-  Single-iteration GRPO with no KL: loss = -E[A * log pi(a|s)], masked to
-  completion tokens. Equivalent to REINFORCE with group-relative baseline.
-  """
+  """Forward pass → per-token log-prob of the realized next token. [B, L-1]."""
   logits, _ = model(
       input_tokens,
       positions,
@@ -344,14 +375,72 @@ def grpo_loss_fn(
   logits = logits[:, :-1, :].astype(jnp.float32)  # [B, L-1, V]
   targets = input_tokens[:, 1:]  # [B, L-1]
   log_probs = jax.nn.log_softmax(logits, axis=-1)
-  per_token_logps = jnp.take_along_axis(
-      log_probs, targets[..., None], axis=-1
-  )[..., 0]  # [B, L-1]
+  return jnp.take_along_axis(log_probs, targets[..., None], axis=-1)[..., 0]
 
+
+# Jitted, grad-free forward for capturing the behavior-policy log-probs that
+# GSPO's importance ratio is measured against. Only used on the gspo path.
+_compute_old_logps = nnx.jit(_compute_per_token_logps)
+
+
+def policy_loss_fn(
+    model: model_lib.Qwen3VL,
+    input_tokens: jax.Array,  # [B, L]
+    positions: jax.Array,  # [3, B, L]
+    pixel_values: jax.Array,  # [P, C]
+    vision_grid: VisionGridData,
+    padding_mask: jax.Array,  # [B, L]
+    completion_mask: jax.Array,  # [B, L] — 1 where loss applies
+    advantages: jax.Array,  # [B]
+    old_per_token_logps: jax.Array,  # [B, L-1] — behavior policy (gspo only)
+) -> jax.Array:
+  """GRPO or GSPO-token policy-gradient loss on completion tokens.
+
+  GRPO (``LOSS_ALGO != 'gspo'``): ``loss = -E[A * log pi(a|s)]`` with a global
+  token-mean — the original Phase-4/6 REINFORCE-with-group-baseline path,
+  numerically unchanged.
+
+  GSPO-token (``LOSS_ALGO == 'gspo'``, Zheng et al. 2507.18071): a
+  sequence-level, length-normalized importance ratio with token-level gradient
+  and PPO clipping. On the first inner iteration ``old == current`` so the
+  ratio is 1 and it coincides with GRPO; off-policy inner iterations are where
+  the clip applies. Mirrors tunix ``grpo_learner`` gspo-token + verl
+  ``loss_mode=gspo`` / ``loss_agg_mode=seq-mean-token-mean``.
+  """
+  per_token_logps = _compute_per_token_logps(
+      model,
+      input_tokens=input_tokens,
+      positions=positions,
+      pixel_values=pixel_values,
+      vision_grid=vision_grid,
+      padding_mask=padding_mask,
+  )  # [B, L-1]
   mask = completion_mask[:, 1:].astype(jnp.float32)  # [B, L-1]
-  per_token_loss = -jnp.expand_dims(advantages, 1) * per_token_logps
-  denom = jnp.clip(jnp.sum(mask), min=1.0)
-  return jnp.sum(per_token_loss * mask) / denom
+  adv = jnp.expand_dims(advantages, 1)  # [B, 1]
+
+  if LOSS_ALGO != 'gspo':
+    per_token_loss = -adv * per_token_logps
+    denom = jnp.clip(jnp.sum(mask), min=1.0)
+    return jnp.sum(per_token_loss * mask) / denom
+
+  # Sequence-level, length-normalized log importance ratio.
+  log_ratio_tok = per_token_logps - old_per_token_logps  # [B, L-1]
+  seq_log_ratio = (log_ratio_tok * mask).sum(-1) / jnp.clip(
+      mask.sum(-1), min=1.0
+  )  # [B]
+  # GSPO-token: sequence-level weight carried with a token-level gradient.
+  si = (
+      per_token_logps
+      - jax.lax.stop_gradient(per_token_logps)
+      + jnp.expand_dims(jax.lax.stop_gradient(seq_log_ratio), 1)
+  )  # [B, L-1]
+  si = jnp.clip(si, max=CLIP_C)
+  coef_1 = jnp.exp(si)
+  coef_2 = jnp.clip(coef_1, 1.0 - CLIP_LOW, 1.0 + CLIP_HIGH)
+  per_token_loss = -jnp.minimum(coef_1 * adv, coef_2 * adv)  # [B, L-1]
+  # seq-mean-token-mean: per-sequence token-mean, then batch-mean.
+  seq_loss = (per_token_loss * mask).sum(-1) / jnp.clip(mask.sum(-1), min=1.0)
+  return seq_loss.mean()
 
 
 # ---------------------------------------------------------------------------
@@ -369,11 +458,12 @@ def _train_step_impl(
     padding_mask: jax.Array,
     completion_mask: jax.Array,
     advantages: jax.Array,
+    old_per_token_logps: jax.Array,
 ) -> jax.Array:
   """Single grad step. Mutates `model` and `optimizer` in place."""
 
   def loss_only(m):
-    return grpo_loss_fn(
+    return policy_loss_fn(
         m,
         input_tokens=input_tokens,
         positions=positions,
@@ -382,6 +472,7 @@ def _train_step_impl(
         padding_mask=padding_mask,
         completion_mask=completion_mask,
         advantages=advantages,
+        old_per_token_logps=old_per_token_logps,
     )
 
   loss, grads = nnx.value_and_grad(loss_only)(model)
@@ -619,6 +710,46 @@ def main():
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     _shard_optimizer_state(optimizer, mesh)
 
+  if LOSS_ALGO == 'gspo':
+    logger.info(
+        '[policy-loss] algo=gspo (seq-mean-token-mean) num_iterations=%d'
+        ' clip_low=%.2g clip_high=%.2g clip_c=%.2g lr=%.2g',
+        NUM_ITERATIONS, CLIP_LOW, CLIP_HIGH, CLIP_C, LEARNING_RATE,
+    )
+    if NUM_ITERATIONS < 2:
+      logger.warning(
+          '[policy-loss] GSPO with num_iterations=%d is on-policy and'
+          ' numerically identical to GRPO — set QWEN3VL_NUM_ITERATIONS>=2'
+          ' for the importance-ratio clip to take effect.',
+          NUM_ITERATIONS,
+      )
+  else:
+    logger.info(
+        '[policy-loss] algo=grpo (REINFORCE + group baseline)'
+        ' num_iterations=%d lr=%.2g', NUM_ITERATIONS, LEARNING_RATE,
+    )
+
+  # Multi-host SPMD requires identical policy-loss config on every process:
+  # LOSS_ALGO drives a jit-time Python branch and NUM_ITERATIONS drives the
+  # number of donated train-step calls, so a per-host divergence compiles
+  # different programs and silent-dies (same failure class as the step-1
+  # prompt_seq_len drift guard). Assert uniformity loudly before the first jit.
+  if jax.process_count() > 1:
+    local_cfg = jnp.asarray(
+        [1.0 if LOSS_ALGO == 'gspo' else 0.0, float(NUM_ITERATIONS),
+         CLIP_LOW, CLIP_HIGH, CLIP_C],
+        dtype=jnp.float32,
+    )
+    all_cfg = np.asarray(multihost_utils.process_allgather(local_cfg))
+    if not np.all(all_cfg == all_cfg[0]):
+      raise RuntimeError(
+          'policy-loss config differs across hosts (rows ='
+          f' [algo, iters, clip_low, clip_high, clip_c]): {all_cfg.tolist()}.'
+          ' All workers must export identical QWEN3VL_LOSS_ALGO /'
+          ' NUM_ITERATIONS / CLIP_* — divergence silent-dies under SPMD.'
+      )
+    logger.info('[policy-loss] config uniform across %d hosts', all_cfg.shape[0])
+
   # --- Dataset ---
   data_iter = iter(create_dataset())
   fixed_batch: list[dict[str, Any]] | None = None
@@ -846,22 +977,53 @@ def main():
     )
 
     advantages = jnp.array(advantages_np, dtype=jnp.float32)
+    enc_input_tokens = jnp.array(encoded.input_tokens)
+    enc_positions = jnp.array(encoded.positions)
+    enc_pixel_values = jnp.array(encoded.pixel_values, dtype=jnp.bfloat16)
+    enc_padding_mask = jnp.array(encoded.input_mask).astype(jnp.bool_)
+    enc_completion_mask = jnp.array(encoded.completion_mask)
 
-    # 7. Grad step (jitted, optimizer donated in place).
+    # 7. Grad step(s) (jitted, optimizer donated in place).
     with mesh:
-      loss = _train_step(
-          model,
-          optimizer,
-          input_tokens=jnp.array(encoded.input_tokens),
-          positions=jnp.array(encoded.positions),
-          pixel_values=jnp.array(encoded.pixel_values, dtype=jnp.bfloat16),
-          vision_grid=encoded.vision_grid,
-          padding_mask=jnp.array(encoded.input_mask).astype(jnp.bool_),
-          completion_mask=jnp.array(encoded.completion_mask),
-          advantages=advantages,
-      )
+      # GSPO measures its importance ratio against the behavior policy, so
+      # capture the pre-update log-probs ONCE before the inner loop. The
+      # GRPO path never reads this; pass a correctly-shaped zero so the
+      # jitted train step keeps a single, stable signature.
+      if LOSS_ALGO == 'gspo':
+        old_per_token_logps = _compute_old_logps(
+            model,
+            input_tokens=enc_input_tokens,
+            positions=enc_positions,
+            pixel_values=enc_pixel_values,
+            vision_grid=encoded.vision_grid,
+            padding_mask=enc_padding_mask,
+        )
+      else:
+        old_per_token_logps = jnp.zeros(
+            (enc_input_tokens.shape[0], enc_input_tokens.shape[1] - 1),
+            dtype=jnp.float32,
+        )
+      # NUM_ITERATIONS optimizer steps reusing this rollout. Iteration 0 is
+      # on-policy (ratio == 1); iterations >=1 are off-policy, where GSPO's
+      # sequence-level clip takes effect. GRPO uses NUM_ITERATIONS=1.
+      for _inner_it in range(NUM_ITERATIONS):
+        loss = _train_step(
+            model,
+            optimizer,
+            input_tokens=enc_input_tokens,
+            positions=enc_positions,
+            pixel_values=enc_pixel_values,
+            vision_grid=encoded.vision_grid,
+            padding_mask=enc_padding_mask,
+            completion_mask=enc_completion_mask,
+            advantages=advantages,
+            old_per_token_logps=old_per_token_logps,
+        )
     rollout.sync_from_actor(nnx.state(model, nnx.Param))
-    logger.info('[step %d] loss=%.4f', step, float(loss))
+    logger.info(
+        '[step %d] loss=%.4f (algo=%s iters=%d)',
+        step, float(loss), LOSS_ALGO, NUM_ITERATIONS,
+    )
 
     # 7b. Characterize peak HBM after step 1 (rollout + train step both
     # done) so we know our margin to OOM. Cheap; one-shot.
