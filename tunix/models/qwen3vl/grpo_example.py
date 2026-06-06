@@ -148,6 +148,25 @@ QWEN3VL_VERO_IMAGE_ROOT = os.environ.get('QWEN3VL_VERO_IMAGE_ROOT', '')
 QWEN3VL_VERO_LOCAL_DIR = os.environ.get(
     'QWEN3VL_VERO_LOCAL_DIR', '/tmp/qwen3vl_vero_smoke'
 )
+# Parquet streaming over the Vero-600k HF snapshot. When PARQUET_ROOT is
+# set it takes precedence over the JSONL path; the chartqa fallback
+# remains the default when neither is configured.
+QWEN3VL_VERO_PARQUET_ROOT = os.environ.get('QWEN3VL_VERO_PARQUET_ROOT', '')
+QWEN3VL_VERO_PARQUET_LOCAL_DIR = os.environ.get(
+    'QWEN3VL_VERO_PARQUET_LOCAL_DIR', '/tmp/qwen3vl_vero_parquet'
+)
+QWEN3VL_VERO_PARQUET_SHARDS_PER_DOMAIN = int(
+    os.environ.get('QWEN3VL_VERO_PARQUET_SHARDS_PER_DOMAIN', '2')
+)
+# In-scope 5 domains for the Vero-600k parquet snapshot (captioning_IF
+# is intentionally excluded — out of scope per the investigation report).
+DEFAULT_VERO_DOMAINS = (
+    'chart_ocr',
+    'counting_grounding_search',
+    'knowledge_recognition',
+    'spatial_action',
+    'stem',
+)
 QWEN3VL_DOMAINS = [
     s.strip()
     for s in os.environ.get('QWEN3VL_DOMAINS', '').split(',')
@@ -184,9 +203,25 @@ class _PrepareChartQA(grain.MapTransform):
 
 
 def create_dataset():
-  # Vero multi-domain JSONL path takes precedence when configured. Falls
-  # back to the original ChartQA HF dataset path otherwise (Phase 4+5
-  # default — bit-identical to the pre-vero behavior).
+  # Dataset selection precedence (highest first):
+  #   1. Vero-600k parquet snapshot (PARQUET_ROOT set) — streams shards.
+  #   2. Vero multi-domain JSONL (VERO_JSONL set) — preexisting path.
+  #   3. ChartQA HF dataset fallback (bit-identical to pre-vero behavior).
+  if QWEN3VL_VERO_PARQUET_ROOT:
+    from tunix.models.qwen3vl import vero_dataset
+    local_root = vero_dataset.stage_parquet_shards(
+        QWEN3VL_VERO_PARQUET_ROOT,
+        QWEN3VL_DOMAINS or list(DEFAULT_VERO_DOMAINS),
+        QWEN3VL_VERO_PARQUET_SHARDS_PER_DOMAIN,
+        QWEN3VL_VERO_PARQUET_LOCAL_DIR,
+    )
+    return vero_dataset.build_vero_parquet_dataset(
+        local_root,
+        MAX_IMAGE_SIZE,
+        QWEN3VL_DOMAINS,
+        QWEN3VL_MIX_WEIGHTS,
+        shuffle_seed=0,
+    )
   if QWEN3VL_VERO_JSONL:
     from tunix.models.qwen3vl import vero_dataset
     local_jsonl, local_img_root = vero_dataset.download_smoke_assets(
@@ -398,7 +433,19 @@ def main():
 
   # Active dataset banner. Make the vero vs chartqa choice loud at start
   # so it's obvious in the launcher log which path the run is on.
-  if QWEN3VL_VERO_JSONL:
+  if QWEN3VL_VERO_PARQUET_ROOT:
+    logger.info(
+        '[dataset] mode=vero-parquet root=%s local_dir=%s'
+        ' shards_per_domain=%d domains_filter=%s mix_weights=%s'
+        ' format_score=%.3f',
+        QWEN3VL_VERO_PARQUET_ROOT,
+        QWEN3VL_VERO_PARQUET_LOCAL_DIR,
+        QWEN3VL_VERO_PARQUET_SHARDS_PER_DOMAIN,
+        QWEN3VL_DOMAINS or list(DEFAULT_VERO_DOMAINS),
+        QWEN3VL_MIX_WEIGHTS,
+        QWEN3VL_FORMAT_SCORE,
+    )
+  elif QWEN3VL_VERO_JSONL:
     logger.info(
         '[dataset] mode=vero jsonl=%s image_root=%s local_dir=%s'
         ' domains_filter=%s mix_weights=%s format_score=%.3f',
