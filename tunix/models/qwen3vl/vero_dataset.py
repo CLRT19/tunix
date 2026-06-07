@@ -691,6 +691,7 @@ def _load_parquet_shards(
     local_parquet_root: str,
     domains_filter: list[str] | None,
     max_image_size: int,
+    shards_per_domain: int | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
   """Read all staged parquet shards into per-domain row lists.
 
@@ -728,6 +729,12 @@ def _load_parquet_shards(
     shard_paths = sorted(glob.glob(os.path.join(subset_dir, 'train-*.parquet')))
     if not shard_paths:
       continue
+    # Cap shards read per subset. Reading straight from the bucket (gcsfuse),
+    # the subset dir holds ALL shards; without this cap we'd pull the entire
+    # Vero-600k tree (hundreds of GB) into RAM. Each shard is read into memory
+    # once here, so per-step training reads come from RAM, not the bucket.
+    if shards_per_domain:
+      shard_paths = shard_paths[: int(shards_per_domain)]
     for shard_path in shard_paths:
       try:
         pf = pq.ParquetFile(shard_path)
@@ -823,6 +830,7 @@ def build_vero_parquet_dataset(
     domains_filter: list[str] | None = None,
     mix_weights: list[float] | None = None,
     shuffle_seed: int = 0,
+    shards_per_domain: int | None = None,
 ) -> grain.DataLoader:
   """Build a grain ``DataLoader`` over locally-staged Vero-600k parquet.
 
@@ -858,6 +866,7 @@ def build_vero_parquet_dataset(
   """
   domain_to_rows = _load_parquet_shards(
       local_parquet_root, domains_filter, max_image_size,
+      shards_per_domain=shards_per_domain,
   )
   total = sum(len(v) for v in domain_to_rows.values())
   if total == 0:

@@ -258,6 +258,18 @@ class _PrepareChartQA(grain.MapTransform):
     }
 
 
+def _gs_to_gcsfuse(uri: str) -> str:
+  """Map a ``gs://<bucket>/<path>`` URI to its gcsfuse mountpoint so we can
+  read it as a local path WITHOUT copying to the boot disk. The bucket is
+  mounted at ``QWEN3VL_GCSFUSE_MOUNT`` (default ``/home/linrong/bucket``)."""
+  mount = os.environ.get('QWEN3VL_GCSFUSE_MOUNT', '/home/linrong/bucket')
+  bucket = os.environ.get('QWEN3VL_GCS_BUCKET', 'linrong-vlm-tpu-us-central1-a')
+  prefix = f'gs://{bucket}/'
+  if uri.startswith(prefix):
+    return os.path.join(mount, uri[len(prefix):])
+  return uri  # already a local / gcsfuse path
+
+
 def create_dataset():
   # Dataset selection precedence (highest first):
   #   1. Vero-600k parquet snapshot (PARQUET_ROOT set) — streams shards.
@@ -265,18 +277,20 @@ def create_dataset():
   #   3. ChartQA HF dataset fallback (bit-identical to pre-vero behavior).
   if QWEN3VL_VERO_PARQUET_ROOT:
     from tunix.models.qwen3vl import vero_dataset
-    local_root = vero_dataset.stage_parquet_shards(
-        QWEN3VL_VERO_PARQUET_ROOT,
-        QWEN3VL_DOMAINS or list(DEFAULT_VERO_DOMAINS),
-        QWEN3VL_VERO_PARQUET_SHARDS_PER_DOMAIN,
-        QWEN3VL_VERO_PARQUET_LOCAL_DIR,
-    )
+    # Read parquet DIRECTLY from the gcsfuse-mounted bucket — do NOT copy
+    # shards to the local boot disk (small + shared). shards_per_domain caps
+    # how many shards per subset are read into RAM at startup; per-step reads
+    # then come from RAM, not the bucket.
+    parquet_root = _gs_to_gcsfuse(QWEN3VL_VERO_PARQUET_ROOT)
+    logger.info('[vero-parquet] reading from bucket (no local copy): %s',
+                parquet_root)
     return vero_dataset.build_vero_parquet_dataset(
-        local_root,
+        parquet_root,
         MAX_IMAGE_SIZE,
         QWEN3VL_DOMAINS,
         QWEN3VL_MIX_WEIGHTS,
         shuffle_seed=0,
+        shards_per_domain=QWEN3VL_VERO_PARQUET_SHARDS_PER_DOMAIN,
     )
   if QWEN3VL_VERO_JSONL:
     from tunix.models.qwen3vl import vero_dataset
