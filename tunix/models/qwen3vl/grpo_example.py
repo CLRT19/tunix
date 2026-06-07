@@ -546,6 +546,12 @@ def main():
   global WANDB_ENABLED
   WANDB_ENABLED = WANDB_ENABLED and is_primary
   if WANDB_ENABLED:
+    # Empty-string WANDB_* env vars (e.g. an unset launcher default exported as
+    # '') break wandb 0.27's pydantic Settings (mode is a Literal). Drop them so
+    # wandb falls back to its own defaults.
+    for _k in ('WANDB_MODE', 'WANDB_ENTITY', 'WANDB_NAME'):
+      if os.environ.get(_k, None) == '':
+        del os.environ[_k]
     try:
       _wandb.init(
           project=WANDB_PROJECT,
