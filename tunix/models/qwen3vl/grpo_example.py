@@ -567,9 +567,16 @@ def main():
     for _k in ('WANDB_MODE', 'WANDB_ENTITY', 'WANDB_NAME'):
       if os.environ.get(_k, None) == '':
         del os.environ[_k]
+    # Force wandb to run in a THREAD, never FORK a service process. A fork on
+    # the primary host around JAX/libtpu collectives corrupts worker 0's TPU
+    # state and hangs the multi-host model-load (all hosts freeze). This — not
+    # the import — was the real hang: wandb-enabled runs froze at load while
+    # WANDB_MODE=disabled runs sailed through.
+    os.environ['WANDB_START_METHOD'] = 'thread'
     try:
       import wandb as _wandb  # lazy, primary-only, post-JAX-init
       _wandb.init(
+          settings=_wandb.Settings(start_method='thread'),
           project=WANDB_PROJECT,
           entity=WANDB_ENTITY,
           name=WANDB_RUN_NAME,
