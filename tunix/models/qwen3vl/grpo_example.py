@@ -45,6 +45,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -72,12 +73,12 @@ from tunix.rl.rollout import base_rollout
 from tunix.rl.rollout import qwen3vl_vanilla_rollout
 from tunix.sft.utils import show_hbm_usage
 
-# Optional Weights & Biases logging. Imported LAZILY inside main() on the
-# primary process only, AFTER JAX init. A host-asymmetric top-level import
-# (worker 0 has wandb, others don't) pulls in grpc/protobuf/threads before
-# JAX/libtpu setup and desyncs the multi-host model-load collective -> all
-# hosts hang. Keep it out of module scope.
-_wandb = None
+# Metrics are written as a JSONL stream by the primary process and pushed to
+# Weights & Biases by a SEPARATE sidecar (scripts/multihost/wandb_sync_jsonl.py).
+# wandb is deliberately NOT imported/run in the training process: wandb 0.27
+# forks a service process (start_method is ignored) that corrupts worker 0's
+# libtpu state and hangs the multi-host model-load. File handle set in main().
+_METRICS_FH = None
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger().setLevel(logging.INFO)
@@ -149,17 +150,11 @@ CLIP_HIGH = float(os.environ.get('QWEN3VL_CLIP_HIGH', '4e-4'))
 # Safety bound on the log importance ratio before exp (verl clip_ratio_c).
 CLIP_C = float(os.environ.get('QWEN3VL_CLIP_C', '10.0'))
 
-# Weights & Biases. Logging happens on the primary process only, and only when
-# wandb is importable and not explicitly disabled. WANDB_MODE=disabled (or an
-# unset/empty project) turns it off entirely.
-WANDB_PROJECT = os.environ.get('WANDB_PROJECT', 'qwen3vl-vero-gspo')
-WANDB_ENTITY = os.environ.get('WANDB_ENTITY') or None
-WANDB_RUN_NAME = os.environ.get('WANDB_NAME') or None
-# Resolved against the lazy import + is_primary inside main().
-WANDB_ENABLED = (
-    os.environ.get('WANDB_MODE', '').lower() != 'disabled'
-    and bool(WANDB_PROJECT)
-)
+# Metrics JSONL path (primary process writes one JSON object per step). The
+# sidecar pushes it to wandb. Empty / WANDB_MODE=disabled turns metrics off.
+# Default sits next to the checkpoints (on the bucket).
+METRICS_JSONL = os.environ.get('QWEN3VL_METRICS_JSONL', '')
+METRICS_ENABLED = os.environ.get('WANDB_MODE', '').lower() != 'disabled'
 
 MAX_STEPS = int(os.environ.get('QWEN3VL_MAX_STEPS', '4'))
 CKPT_EVERY_N_STEPS = int(os.environ.get('QWEN3VL_CKPT_EVERY_N_STEPS', '2'))
@@ -555,59 +550,33 @@ def main():
   if is_primary:
     os.makedirs(CKPT_DIR, exist_ok=True)
 
-  # Weights & Biases — primary process only (reads ~/.netrc for auth). The
-  # import is deferred to HERE (after JAX init, primary only) so a host-0-only
-  # wandb import can't desync the multi-host model-load collective.
-  global WANDB_ENABLED, _wandb
-  WANDB_ENABLED = WANDB_ENABLED and is_primary
-  if WANDB_ENABLED:
-    # Empty-string WANDB_* env vars (e.g. an unset launcher default exported as
-    # '') break wandb 0.27's pydantic Settings (mode is a Literal). Drop them so
-    # wandb falls back to its own defaults.
-    for _k in ('WANDB_MODE', 'WANDB_ENTITY', 'WANDB_NAME'):
-      if os.environ.get(_k, None) == '':
-        del os.environ[_k]
-    # Force wandb to run in a THREAD, never FORK a service process. A fork on
-    # the primary host around JAX/libtpu collectives corrupts worker 0's TPU
-    # state and hangs the multi-host model-load (all hosts freeze). This — not
-    # the import — was the real hang: wandb-enabled runs froze at load while
-    # WANDB_MODE=disabled runs sailed through.
-    os.environ['WANDB_START_METHOD'] = 'thread'
+  # Metrics — primary process only, written as a JSONL stream (NO wandb in the
+  # training process; see _METRICS_FH note above). A sidecar pushes it to wandb.
+  global _METRICS_FH
+  metrics_path = METRICS_JSONL or os.path.join(
+      os.path.dirname(CKPT_DIR.rstrip('/')), 'metrics.jsonl'
+  )
+  if is_primary and METRICS_ENABLED and metrics_path:
     try:
-      import wandb as _wandb  # lazy, primary-only, post-JAX-init
-      _wandb.init(
-          settings=_wandb.Settings(start_method='thread'),
-          project=WANDB_PROJECT,
-          entity=WANDB_ENTITY,
-          name=WANDB_RUN_NAME,
-          config={
-              'loss_algo': LOSS_ALGO,
-              'num_iterations': NUM_ITERATIONS,
-              'clip_low': CLIP_LOW,
-              'clip_high': CLIP_HIGH,
-              'clip_c': CLIP_C,
-              'lr': LEARNING_RATE,
-              'grad_clip': GRAD_CLIP,
-              'num_prompts': NUM_PROMPTS,
-              'num_generations': NUM_GENERATIONS,
-              'max_new_tokens': MAX_NEW_TOKENS,
-              'max_seq_len': MAX_SEQ_LEN,
-              'max_steps': MAX_STEPS,
-              'temperature': float(os.environ.get('QWEN3VL_TEMPERATURE', '1.0')),
-              'top_p': float(os.environ.get('QWEN3VL_TOP_P', '0.95')),
-              'mesh_shape': os.environ.get('QWEN3VL_MESH_SHAPE', ''),
-              'model_dir': MODEL_ID,
-              'model_size': MODEL_SIZE,
-              'rollout_engine': ROLLOUT_ENGINE,
-              'format_score': QWEN3VL_FORMAT_SCORE,
-              'dataset': 'vero-parquet' if QWEN3VL_VERO_PARQUET_ROOT else (
-                  'vero-jsonl' if QWEN3VL_VERO_JSONL else DATASET_ID),
-          },
-      )
-      logger.info('[wandb] run=%s', _wandb.run.url)
+      os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
+      _METRICS_FH = open(metrics_path, 'a', buffering=1)  # line-buffered
+      _cfg = {
+          'loss_algo': LOSS_ALGO, 'num_iterations': NUM_ITERATIONS,
+          'clip_low': CLIP_LOW, 'clip_high': CLIP_HIGH, 'clip_c': CLIP_C,
+          'lr': LEARNING_RATE, 'grad_clip': GRAD_CLIP,
+          'num_prompts': NUM_PROMPTS, 'num_generations': NUM_GENERATIONS,
+          'max_new_tokens': MAX_NEW_TOKENS, 'max_seq_len': MAX_SEQ_LEN,
+          'max_steps': MAX_STEPS, 'mesh_shape': os.environ.get('QWEN3VL_MESH_SHAPE', ''),
+          'model_size': MODEL_SIZE, 'rollout_engine': ROLLOUT_ENGINE,
+          'format_score': QWEN3VL_FORMAT_SCORE,
+          'dataset': 'vero-parquet' if QWEN3VL_VERO_PARQUET_ROOT else (
+              'vero-jsonl' if QWEN3VL_VERO_JSONL else DATASET_ID),
+      }
+      _METRICS_FH.write(json.dumps({'_config': _cfg}) + '\n')
+      logger.info('[metrics] JSONL stream -> %s', metrics_path)
     except Exception as e:  # never let logging kill training
-      logger.warning('[wandb] init failed (%s); disabling wandb.', e)
-      WANDB_ENABLED = False
+      logger.warning('[metrics] could not open %s: %s', metrics_path, e)
+      _METRICS_FH = None
 
   # Active dataset banner. Make the vero vs chartqa choice loud at start
   # so it's obvious in the launcher log which path the run is on.
@@ -1119,8 +1088,9 @@ def main():
         step, float(loss), LOSS_ALGO, NUM_ITERATIONS,
     )
 
-    if WANDB_ENABLED:
+    if _METRICS_FH is not None:
       metrics = {
+          'step': step,
           'train/loss': float(loss),
           'reward/mean': float(rewards.mean()),
           'reward/min': float(rewards.min()),
@@ -1140,9 +1110,9 @@ def main():
           if idx.size:
             metrics[f'reward_by_domain/{d}'] = float(rewards[idx].mean())
       try:
-        _wandb.log(metrics, step=step)
+        _METRICS_FH.write(json.dumps(metrics) + '\n')
       except Exception as e:  # logging must never crash training
-        logger.warning('[wandb] log failed at step %d: %s', step, e)
+        logger.warning('[metrics] write failed at step %d: %s', step, e)
 
     # 7b. Characterize peak HBM after step 1 (rollout + train step both
     # done) so we know our margin to OOM. Cheap; one-shot.
@@ -1159,11 +1129,11 @@ def main():
       ckpt_mgr.wait_until_finished()
 
   ckpt_mgr.close()
-  if WANDB_ENABLED:
+  if _METRICS_FH is not None:
     try:
-      _wandb.finish()
-    except Exception as e:
-      logger.warning('[wandb] finish failed: %s', e)
+      _METRICS_FH.close()
+    except Exception:  # pylint: disable=broad-except
+      pass
   logger.info('GRPO smoke complete. Checkpoints in %s', CKPT_DIR)
 
 
