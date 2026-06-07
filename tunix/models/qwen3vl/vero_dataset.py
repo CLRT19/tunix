@@ -692,6 +692,7 @@ def _load_parquet_shards(
     domains_filter: list[str] | None,
     max_image_size: int,
     shards_per_domain: int | None = None,
+    max_rows_per_domain: int | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
   """Read all staged parquet shards into per-domain row lists.
 
@@ -716,6 +717,11 @@ def _load_parquet_shards(
     raise ValueError(
         f'[vero-parquet] local root does not exist: {local_parquet_root}'
     )
+  # Per-domain row counter so we can bound how much is decoded into RAM. The
+  # shards_per_domain cap is PER SUBSET DIR, and a domain (e.g. chart_ocr) can
+  # have many subset dirs, so without this a "domain" pulls tens of thousands of
+  # rows and the startup decode crawls. Counts by the subset's domain prefix.
+  per_domain_added: dict[str, int] = {}
   subset_names = sorted(os.listdir(local_parquet_root))
   for subset_name in subset_names:
     subset_dir = os.path.join(local_parquet_root, subset_name)
@@ -726,6 +732,8 @@ def _load_parquet_shards(
     domain = subset_name.split('-', 1)[0]
     if domains_set is not None and domain not in domains_set:
       continue
+    if max_rows_per_domain and per_domain_added.get(domain, 0) >= max_rows_per_domain:
+      continue  # this domain already has enough rows
     shard_paths = sorted(glob.glob(os.path.join(subset_dir, 'train-*.parquet')))
     if not shard_paths:
       continue
@@ -751,7 +759,10 @@ def _load_parquet_shards(
       except Exception:  # pylint: disable=broad-except
         # Older pyarrow versions don't accept columns kwarg on iter_batches.
         batches = pf.iter_batches(batch_size=128)
+      domain_full = False
       for batch in batches:
+        if domain_full:
+          break
         for raw in batch.to_pylist():
           image_field = raw.get('image')
           prompt = raw.get('prompt')
@@ -797,11 +808,17 @@ def _load_parquet_shards(
               ),
           }
           domain_to_rows.setdefault(ability, []).append(row)
+          per_domain_added[domain] = per_domain_added.get(domain, 0) + 1
+          if max_rows_per_domain and per_domain_added[domain] >= max_rows_per_domain:
+            domain_full = True
+            break
       logger.info(
           '[vero-parquet] loaded shard %s (domain=%s, running_total=%d)',
           os.path.basename(shard_path), domain,
-          len(domain_to_rows.get(domain, [])),
+          per_domain_added.get(domain, 0),
       )
+      if domain_full:
+        break  # stop reading further shards for this subset/domain
 
   if dropped_missing or dropped_decode:
     logger.warning(
@@ -831,6 +848,7 @@ def build_vero_parquet_dataset(
     mix_weights: list[float] | None = None,
     shuffle_seed: int = 0,
     shards_per_domain: int | None = None,
+    max_rows_per_domain: int | None = None,
 ) -> grain.DataLoader:
   """Build a grain ``DataLoader`` over locally-staged Vero-600k parquet.
 
@@ -867,6 +885,7 @@ def build_vero_parquet_dataset(
   domain_to_rows = _load_parquet_shards(
       local_parquet_root, domains_filter, max_image_size,
       shards_per_domain=shards_per_domain,
+      max_rows_per_domain=max_rows_per_domain,
   )
   total = sum(len(v) for v in domain_to_rows.values())
   if total == 0:

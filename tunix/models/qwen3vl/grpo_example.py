@@ -209,6 +209,12 @@ QWEN3VL_VERO_PARQUET_LOCAL_DIR = os.environ.get(
 QWEN3VL_VERO_PARQUET_SHARDS_PER_DOMAIN = int(
     os.environ.get('QWEN3VL_VERO_PARQUET_SHARDS_PER_DOMAIN', '2')
 )
+# Cap rows decoded into RAM per domain (0 = unlimited). shards_per_domain is a
+# PER-SUBSET cap; a domain has many subset dirs, so this bounds the one-time
+# startup decode + RAM. ~2000 covers a 1000+ step run; smokes use less.
+QWEN3VL_VERO_MAX_ROWS_PER_DOMAIN = int(
+    os.environ.get('QWEN3VL_VERO_MAX_ROWS_PER_DOMAIN', '0')
+)
 # In-scope 5 domains for the Vero-600k parquet snapshot (captioning_IF
 # is intentionally excluded — out of scope per the investigation report).
 DEFAULT_VERO_DOMAINS = (
@@ -286,6 +292,7 @@ def create_dataset():
         QWEN3VL_MIX_WEIGHTS,
         shuffle_seed=0,
         shards_per_domain=QWEN3VL_VERO_PARQUET_SHARDS_PER_DOMAIN,
+        max_rows_per_domain=QWEN3VL_VERO_MAX_ROWS_PER_DOMAIN or None,
     )
   if QWEN3VL_VERO_JSONL:
     from tunix.models.qwen3vl import vero_dataset
