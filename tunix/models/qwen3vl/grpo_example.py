@@ -72,13 +72,12 @@ from tunix.rl.rollout import base_rollout
 from tunix.rl.rollout import qwen3vl_vanilla_rollout
 from tunix.sft.utils import show_hbm_usage
 
-# Optional Weights & Biases logging. Installed only in the primary (process 0)
-# venv — non-primary workers don't import it, so failure is silent and the
-# trainer runs identically without wandb.
-try:
-  import wandb as _wandb
-except ImportError:
-  _wandb = None
+# Optional Weights & Biases logging. Imported LAZILY inside main() on the
+# primary process only, AFTER JAX init. A host-asymmetric top-level import
+# (worker 0 has wandb, others don't) pulls in grpc/protobuf/threads before
+# JAX/libtpu setup and desyncs the multi-host model-load collective -> all
+# hosts hang. Keep it out of module scope.
+_wandb = None
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger().setLevel(logging.INFO)
@@ -156,9 +155,9 @@ CLIP_C = float(os.environ.get('QWEN3VL_CLIP_C', '10.0'))
 WANDB_PROJECT = os.environ.get('WANDB_PROJECT', 'qwen3vl-vero-gspo')
 WANDB_ENTITY = os.environ.get('WANDB_ENTITY') or None
 WANDB_RUN_NAME = os.environ.get('WANDB_NAME') or None
+# Resolved against the lazy import + is_primary inside main().
 WANDB_ENABLED = (
-    _wandb is not None
-    and os.environ.get('WANDB_MODE', '').lower() != 'disabled'
+    os.environ.get('WANDB_MODE', '').lower() != 'disabled'
     and bool(WANDB_PROJECT)
 )
 
@@ -542,8 +541,10 @@ def main():
   if is_primary:
     os.makedirs(CKPT_DIR, exist_ok=True)
 
-  # Weights & Biases — primary process only (reads ~/.netrc for auth).
-  global WANDB_ENABLED
+  # Weights & Biases — primary process only (reads ~/.netrc for auth). The
+  # import is deferred to HERE (after JAX init, primary only) so a host-0-only
+  # wandb import can't desync the multi-host model-load collective.
+  global WANDB_ENABLED, _wandb
   WANDB_ENABLED = WANDB_ENABLED and is_primary
   if WANDB_ENABLED:
     # Empty-string WANDB_* env vars (e.g. an unset launcher default exported as
@@ -553,6 +554,7 @@ def main():
       if os.environ.get(_k, None) == '':
         del os.environ[_k]
     try:
+      import wandb as _wandb  # lazy, primary-only, post-JAX-init
       _wandb.init(
           project=WANDB_PROJECT,
           entity=WANDB_ENTITY,
@@ -641,9 +643,16 @@ def main():
     mesh = jax.sharding.Mesh(devices, ('fsdp', 'tp'))
   else:
     mesh = jax.make_mesh(MESH_SHAPE, ('fsdp', 'tp'))
+  # Barrier so all hosts enter the global-sharding load together. Without it,
+  # fast (local-disk) loads let hosts reach the sharded device_put at very
+  # different times, exposing load-time skew on the multi-host mesh.
+  if jax.process_count() > 1:
+    multihost_utils.sync_global_devices('before_qwen3vl_model_load')
   model = params_lib.create_model_from_safe_tensors(
       model_dir, config, mesh=mesh, dtype=jnp.bfloat16
   )
+  if jax.process_count() > 1:
+    multihost_utils.sync_global_devices('after_qwen3vl_model_load')
   show_hbm_usage()
 
   # Optional warm-start from a previous checkpoint. Restores ONLY model
