@@ -392,6 +392,20 @@ def load_and_create_model_opt(
       if dtype is not None:
         np_dtype = to_np_dtype(dtype)
         tensor = tensor.astype(np_dtype)
+      # On a multi-host global mesh, `jax.device_put(full_local_array,
+      # NamedSharding(global_mesh))` enqueues an async cross-process placement
+      # per param; across thousands of params this intermittently DEADLOCKS the
+      # 8-host load (frozen at the device_put stream). Build each global array
+      # from this host's addressable shards instead — no cross-process xfer.
+      if isinstance(sharding, jax.sharding.Sharding):
+        def _get_shard(index, tensor=tensor):
+          if index is None:
+            return tensor
+          return np.asarray(tensor[index])
+
+        return jax.make_array_from_callback(
+            tensor.shape, sharding, _get_shard, dtype=tensor.dtype
+        )
       return jax.device_put(tensor, sharding)
 
     return _shard_state
