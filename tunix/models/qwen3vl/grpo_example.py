@@ -72,6 +72,14 @@ from tunix.rl.rollout import base_rollout
 from tunix.rl.rollout import qwen3vl_vanilla_rollout
 from tunix.sft.utils import show_hbm_usage
 
+# Optional Weights & Biases logging. Installed only in the primary (process 0)
+# venv — non-primary workers don't import it, so failure is silent and the
+# trainer runs identically without wandb.
+try:
+  import wandb as _wandb
+except ImportError:
+  _wandb = None
+
 logging.basicConfig(level=logging.INFO)
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
@@ -141,6 +149,18 @@ CLIP_LOW = float(os.environ.get('QWEN3VL_CLIP_LOW', '3e-4'))
 CLIP_HIGH = float(os.environ.get('QWEN3VL_CLIP_HIGH', '4e-4'))
 # Safety bound on the log importance ratio before exp (verl clip_ratio_c).
 CLIP_C = float(os.environ.get('QWEN3VL_CLIP_C', '10.0'))
+
+# Weights & Biases. Logging happens on the primary process only, and only when
+# wandb is importable and not explicitly disabled. WANDB_MODE=disabled (or an
+# unset/empty project) turns it off entirely.
+WANDB_PROJECT = os.environ.get('WANDB_PROJECT', 'qwen3vl-vero-gspo')
+WANDB_ENTITY = os.environ.get('WANDB_ENTITY') or None
+WANDB_RUN_NAME = os.environ.get('WANDB_NAME') or None
+WANDB_ENABLED = (
+    _wandb is not None
+    and os.environ.get('WANDB_MODE', '').lower() != 'disabled'
+    and bool(WANDB_PROJECT)
+)
 
 MAX_STEPS = int(os.environ.get('QWEN3VL_MAX_STEPS', '4'))
 CKPT_EVERY_N_STEPS = int(os.environ.get('QWEN3VL_CKPT_EVERY_N_STEPS', '2'))
@@ -521,6 +541,44 @@ def main():
   is_primary = jax.process_index() == 0
   if is_primary:
     os.makedirs(CKPT_DIR, exist_ok=True)
+
+  # Weights & Biases — primary process only (reads ~/.netrc for auth).
+  global WANDB_ENABLED
+  WANDB_ENABLED = WANDB_ENABLED and is_primary
+  if WANDB_ENABLED:
+    try:
+      _wandb.init(
+          project=WANDB_PROJECT,
+          entity=WANDB_ENTITY,
+          name=WANDB_RUN_NAME,
+          config={
+              'loss_algo': LOSS_ALGO,
+              'num_iterations': NUM_ITERATIONS,
+              'clip_low': CLIP_LOW,
+              'clip_high': CLIP_HIGH,
+              'clip_c': CLIP_C,
+              'lr': LEARNING_RATE,
+              'grad_clip': GRAD_CLIP,
+              'num_prompts': NUM_PROMPTS,
+              'num_generations': NUM_GENERATIONS,
+              'max_new_tokens': MAX_NEW_TOKENS,
+              'max_seq_len': MAX_SEQ_LEN,
+              'max_steps': MAX_STEPS,
+              'temperature': float(os.environ.get('QWEN3VL_TEMPERATURE', '1.0')),
+              'top_p': float(os.environ.get('QWEN3VL_TOP_P', '0.95')),
+              'mesh_shape': os.environ.get('QWEN3VL_MESH_SHAPE', ''),
+              'model_dir': MODEL_ID,
+              'model_size': MODEL_SIZE,
+              'rollout_engine': ROLLOUT_ENGINE,
+              'format_score': QWEN3VL_FORMAT_SCORE,
+              'dataset': 'vero-parquet' if QWEN3VL_VERO_PARQUET_ROOT else (
+                  'vero-jsonl' if QWEN3VL_VERO_JSONL else DATASET_ID),
+          },
+      )
+      logger.info('[wandb] run=%s', _wandb.run.url)
+    except Exception as e:  # never let logging kill training
+      logger.warning('[wandb] init failed (%s); disabling wandb.', e)
+      WANDB_ENABLED = False
 
   # Active dataset banner. Make the vero vs chartqa choice loud at start
   # so it's obvious in the launcher log which path the run is on.
@@ -1025,6 +1083,31 @@ def main():
         step, float(loss), LOSS_ALGO, NUM_ITERATIONS,
     )
 
+    if WANDB_ENABLED:
+      metrics = {
+          'train/loss': float(loss),
+          'reward/mean': float(rewards.mean()),
+          'reward/min': float(rewards.min()),
+          'reward/max': float(rewards.max()),
+          'reward/std': float(rewards.std()),
+          'reward/answer_mean': float(answer_rewards.mean()),
+          'reward/format_mean': float(format_rewards.mean()),
+          'advantage/min': float(advantages_np.min()),
+          'advantage/max': float(advantages_np.max()),
+          'advantage/abs_mean': float(np.abs(advantages_np).mean()),
+      }
+      if domains is not None:
+        for d in sorted(set(domains)):
+          idx = np.array(
+              [i for i, dd in enumerate(domains) if dd == d], dtype=np.int64
+          )
+          if idx.size:
+            metrics[f'reward_by_domain/{d}'] = float(rewards[idx].mean())
+      try:
+        _wandb.log(metrics, step=step)
+      except Exception as e:  # logging must never crash training
+        logger.warning('[wandb] log failed at step %d: %s', step, e)
+
     # 7b. Characterize peak HBM after step 1 (rollout + train step both
     # done) so we know our margin to OOM. Cheap; one-shot.
     if step == 1:
@@ -1040,6 +1123,11 @@ def main():
       ckpt_mgr.wait_until_finished()
 
   ckpt_mgr.close()
+  if WANDB_ENABLED:
+    try:
+      _wandb.finish()
+    except Exception as e:
+      logger.warning('[wandb] finish failed: %s', e)
   logger.info('GRPO smoke complete. Checkpoints in %s', CKPT_DIR)
 
 
