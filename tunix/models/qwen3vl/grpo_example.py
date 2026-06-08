@@ -95,6 +95,9 @@ MODEL_SIZE = os.environ.get('QWEN3VL_MODEL_SIZE', '4b').lower()
 # Rollout engine: 'vanilla' (proven pure-JAX sampler, default) or 'vllm'
 # (in-process vLLM, jax 0.9.2 env). Vanilla stays the fallback.
 ROLLOUT_ENGINE = os.environ.get('QWEN3VL_ROLLOUT_ENGINE', 'vanilla').lower()
+# Gradient checkpointing: 'block' (per-layer remat, needed to fit long seqs on
+# the vLLM path) or 'none'. Only safe with the vLLM rollout (see main()).
+QWEN3VL_REMAT = os.environ.get('QWEN3VL_REMAT', 'none').lower()
 DATASET_ID = os.environ.get('QWEN3VL_DATASET', 'HuggingFaceM4/ChartQA')
 DATASET_SPLIT = os.environ.get('QWEN3VL_DATASET_SPLIT', 'train')
 
@@ -182,9 +185,10 @@ MESH_SHAPE = tuple(
 
 SYSTEM_PROMPT = os.environ.get(
     'QWEN3VL_SYSTEM_PROMPT',
-    'You are a helpful assistant. Think step by step inside '
-    '<think>...</think>, then provide your final answer inside '
-    '<answer>...</answer>.',
+    'You are a helpful assistant. Reason briefly inside <think>...</think>, '
+    'then give your final answer inside <answer>...</answer>, wrapping the '
+    'final result in \\boxed{...} — for example <answer>\\boxed{42}</answer>. '
+    'Keep the answer concise.',
 )
 
 # ---------------------------------------------------------------------------
@@ -625,13 +629,23 @@ def main():
   # --- Mesh + model ---
   config = getattr(model_lib.ModelConfig, f'qwen3vl_{MODEL_SIZE}')()
   logger.info('[model] size=%s (from QWEN3VL_MODEL_SIZE)', MODEL_SIZE)
-  # nnx.remat conflicts with the sampler's jax.lax.while_loop (decode loop):
-  # the inner forward pass mutates Param state at a different trace level
-  # inside the while_loop body and raises TraceContextError. The SFT path
-  # disables remat only for sample generation and restores it; GRPO does
-  # rollouts every step, so we disable it for the whole run. 4B params at
-  # bf16 on 32 v5p chips fits comfortably without remat for our smoke.
-  config.remat_config = model_lib.RematConfig.NONE
+  # Gradient checkpointing (per-block remat). nnx.remat conflicts with the
+  # VANILLA sampler's jax.lax.while_loop (TraceContextError), so it must stay
+  # NONE on the vanilla path. But with the vLLM rollout the training model is
+  # ONLY used for the train step (forward+backward) and the old-logps forward —
+  # never for sampling — so remat is safe AND necessary: without it the train
+  # step needs ~80 GiB/chip at seq 1024 and OOMs (RuntimeProgramAllocationFailure)
+  # at the longer seq lengths needed to let the model emit a boxed answer.
+  if QWEN3VL_REMAT == 'block':
+    if ROLLOUT_ENGINE != 'vllm':
+      logger.warning('[remat] BLOCK requested but rollout=%s — remat breaks the'
+                     ' vanilla sampler while_loop; forcing NONE.', ROLLOUT_ENGINE)
+      config.remat_config = model_lib.RematConfig.NONE
+    else:
+      config.remat_config = model_lib.RematConfig.BLOCK
+      logger.info('[remat] gradient checkpointing ON (RematConfig.BLOCK)')
+  else:
+    config.remat_config = model_lib.RematConfig.NONE
   model_dir = resolve_model_dir(MODEL_ID)
   logger.info(
       'Loading Qwen3-VL from %s on mesh %s (proc %d/%d)',
