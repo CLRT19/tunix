@@ -458,23 +458,28 @@ def policy_loss_fn(
     denom = jnp.clip(jnp.sum(mask), min=1.0)
     return jnp.sum(per_token_loss * mask) / denom
 
-  # Sequence-level, length-normalized log importance ratio.
-  log_ratio_tok = per_token_logps - old_per_token_logps  # [B, L-1]
-  seq_log_ratio = (log_ratio_tok * mask).sum(-1) / jnp.clip(
-      mask.sum(-1), min=1.0
-  )  # [B]
+  # Mask with jnp.where (NOT * mask): per_token_logps is computed over ALL
+  # tokens incl prompt/padding, and any inf/nan there would poison the masked
+  # sums via `nan * 0 = nan`. Zeroing the log-probs on non-completion positions
+  # cuts those tokens out of BOTH value and gradient, so padding can never leak.
+  mask_b = mask > 0
+  cur = jnp.where(mask_b, per_token_logps, 0.0)  # [B, L-1], grad only on compl.
+  old = jnp.where(mask_b, old_per_token_logps, 0.0)
+  denom_tok = jnp.clip(mask.sum(-1), min=1.0)  # [B]
+  # Sequence-level, length-normalized log importance ratio (completion only).
+  seq_log_ratio = jnp.where(mask_b, cur - old, 0.0).sum(-1) / denom_tok  # [B]
   # GSPO-token: sequence-level weight carried with a token-level gradient.
-  si = (
-      per_token_logps
-      - jax.lax.stop_gradient(per_token_logps)
-      + jnp.expand_dims(jax.lax.stop_gradient(seq_log_ratio), 1)
+  si = cur - jax.lax.stop_gradient(cur) + jnp.expand_dims(
+      jax.lax.stop_gradient(seq_log_ratio), 1
   )  # [B, L-1]
   si = jnp.clip(si, max=CLIP_C)
   coef_1 = jnp.exp(si)
   coef_2 = jnp.clip(coef_1, 1.0 - CLIP_LOW, 1.0 + CLIP_HIGH)
   per_token_loss = -jnp.minimum(coef_1 * adv, coef_2 * adv)  # [B, L-1]
-  # seq-mean-token-mean: per-sequence token-mean, then batch-mean.
-  seq_loss = (per_token_loss * mask).sum(-1) / jnp.clip(mask.sum(-1), min=1.0)
+  per_token_loss = jnp.where(mask_b, per_token_loss, 0.0)  # drop non-completion
+  # seq-mean-token-mean: per-sequence token-mean, then batch-mean. With adv==0
+  # every per_token_loss is exactly 0 -> loss 0 (no nan).
+  seq_loss = per_token_loss.sum(-1) / denom_tok
   return seq_loss.mean()
 
 
