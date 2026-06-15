@@ -103,6 +103,7 @@ DATASET_SPLIT = os.environ.get('QWEN3VL_DATASET_SPLIT', 'train')
 
 NUM_PROMPTS = int(os.environ.get('QWEN3VL_NUM_PROMPTS', '2'))
 NUM_GENERATIONS = int(os.environ.get('QWEN3VL_NUM_GENERATIONS', '4'))
+TRAIN_BATCH_SIZE = NUM_PROMPTS * NUM_GENERATIONS
 MAX_NEW_TOKENS = int(os.environ.get('QWEN3VL_MAX_NEW_TOKENS', '128'))
 MAX_SEQ_LEN = int(os.environ.get('QWEN3VL_MAX_SEQ_LEN', '1536'))
 ROLLOUT_CACHE_SIZE = int(os.environ.get('QWEN3VL_ROLLOUT_CACHE_SIZE', '1536'))
@@ -145,6 +146,15 @@ else:
 NUM_ITERATIONS = int(os.environ.get('QWEN3VL_NUM_ITERATIONS', '1'))
 if NUM_ITERATIONS < 1:
   raise ValueError(f'QWEN3VL_NUM_ITERATIONS must be >= 1; got {NUM_ITERATIONS}')
+MICRO_BSZ = int(os.environ.get('QWEN3VL_MICRO_BSZ', '0'))
+if MICRO_BSZ < 0:
+  raise ValueError(f'QWEN3VL_MICRO_BSZ must be >= 0; got {MICRO_BSZ}')
+if 0 < MICRO_BSZ < TRAIN_BATCH_SIZE and TRAIN_BATCH_SIZE % MICRO_BSZ != 0:
+  raise ValueError(
+      'QWEN3VL_MICRO_BSZ must divide B=NUM_PROMPTS*NUM_GENERATIONS when'
+      f' accumulation is active; got MICRO_BSZ={MICRO_BSZ},'
+      f' B={TRAIN_BATCH_SIZE}. Set QWEN3VL_MICRO_BSZ=0 to disable.'
+  )
 # GSPO clip range. Tiny by design — the sequence-level ratio is a
 # length-normalized geometric mean, so its variance is far smaller than a
 # token-level ratio and the clip must be correspondingly tight.
@@ -559,6 +569,210 @@ def _train_step_impl(
 _train_step = nnx.jit(_train_step_impl, donate_argnames=('optimizer',))
 
 
+def _micro_grad_impl(
+    model: model_lib.Qwen3VL,
+    micro_input_tokens: jax.Array,
+    micro_positions: jax.Array,
+    micro_pixel_values: jax.Array,
+    micro_vision_grid: VisionGridData,
+    micro_padding_mask: jax.Array,
+    micro_completion_mask: jax.Array,
+    micro_advantages: jax.Array,
+    micro_old_per_token_logps: jax.Array,
+) -> tuple[jax.Array, Any]:
+  """Compute one micro-batch loss and grads without updating optimizer state."""
+
+  def loss_only(m):
+    return policy_loss_fn(
+        m,
+        input_tokens=micro_input_tokens,
+        positions=micro_positions,
+        pixel_values=micro_pixel_values,
+        vision_grid=micro_vision_grid,
+        padding_mask=micro_padding_mask,
+        completion_mask=micro_completion_mask,
+        advantages=micro_advantages,
+        old_per_token_logps=micro_old_per_token_logps,
+    )
+
+  return nnx.value_and_grad(loss_only)(model)
+
+
+_micro_grad_fn = nnx.jit(_micro_grad_impl)
+
+
+def _apply_accumulated_grads_impl(
+    model: model_lib.Qwen3VL,
+    optimizer: nnx.Optimizer,
+    grads: Any,
+) -> jax.Array:
+  """Apply already-accumulated gradients once, donating optimizer state."""
+  optimizer.update(model, grads)
+  return jnp.asarray(0.0, dtype=jnp.float32)
+
+
+_apply_accumulated_grads = nnx.jit(
+    _apply_accumulated_grads_impl, donate_argnames=('optimizer',)
+)
+
+
+def _micro_accumulation_active(batch_size: int) -> bool:
+  return MICRO_BSZ > 0 and MICRO_BSZ < batch_size
+
+
+def _vision_patch_offsets_per_sequence(
+    vision_grid: VisionGridData,
+    *,
+    batch_size: int,
+    total_patches: int,
+) -> np.ndarray:
+  """Return [B+1] patch offsets for this trainer's one-image-per-sequence pack."""
+  offsets = np.asarray(vision_grid.cu_seqlens, dtype=np.int64)
+  if offsets.ndim != 1:
+    raise ValueError(
+        'QWEN3VL_MICRO_BSZ requires 1-D vision_grid.cu_seqlens; got'
+        f' shape={offsets.shape}.'
+    )
+  # encode_messages flattens images in sequence order, and grpo_example builds
+  # exactly one image per sequence. Under that constraint each cu_seqlens segment
+  # is the patch span for the matching sequence, so patch counts may vary without
+  # assuming uniform images. Multi-image or video rows need an explicit
+  # image-to-sequence map before they can be micro-batched here.
+  if offsets.shape[0] != batch_size + 1:
+    raise ValueError(
+        'QWEN3VL_MICRO_BSZ currently requires exactly one image frame per'
+        ' sequence so vision_grid.cu_seqlens has B+1 entries; got'
+        f' cu_seqlens={offsets.shape[0]} entries for B={batch_size}.'
+    )
+  if int(offsets[0]) != 0 or int(offsets[-1]) != total_patches:
+    raise ValueError(
+        'vision_grid.cu_seqlens does not match packed pixel_values:'
+        f' first={int(offsets[0])}, last={int(offsets[-1])},'
+        f' total_patches={total_patches}.'
+    )
+  return offsets
+
+
+def _slice_vision_grid(
+    vision_grid: VisionGridData,
+    *,
+    seq_start: int,
+    seq_end: int,
+    patch_start: int,
+    patch_end: int,
+) -> VisionGridData:
+  """Slice precomputed vision metadata to match a contiguous pixel patch span."""
+  cu_seqlens = vision_grid.cu_seqlens[seq_start : seq_end + 1]
+  cu_seqlens = cu_seqlens - cu_seqlens[0]
+  pos_embed_idx = vision_grid.pos_embed_idx[:, patch_start:patch_end]
+  pos_embed_weights = vision_grid.pos_embed_weights[:, patch_start:patch_end]
+  pos_embed_gather = vision_grid.pos_embed_gather[patch_start:patch_end]
+  if pos_embed_idx.shape[1] > 0:
+    pos_embed_gather = pos_embed_gather - patch_start
+  return VisionGridData(
+      cos=vision_grid.cos[patch_start:patch_end],
+      sin=vision_grid.sin[patch_start:patch_end],
+      cu_seqlens=cu_seqlens,
+      pos_embed_idx=pos_embed_idx,
+      pos_embed_weights=pos_embed_weights,
+      pos_embed_gather=pos_embed_gather,
+  )
+
+
+def _train_step_accum(
+    model: model_lib.Qwen3VL,
+    optimizer: nnx.Optimizer,
+    input_tokens: jax.Array,
+    positions: jax.Array,
+    pixel_values: jax.Array,
+    vision_grid: VisionGridData,
+    padding_mask: jax.Array,
+    completion_mask: jax.Array,
+    advantages: jax.Array,
+    old_per_token_logps: jax.Array,
+    patch_offsets: np.ndarray,
+) -> jax.Array:
+  """Micro-batch one logical train step and apply the averaged gradients once."""
+  batch_size = input_tokens.shape[0]
+  if not _micro_accumulation_active(batch_size):
+    return _train_step(
+        model,
+        optimizer,
+        input_tokens=input_tokens,
+        positions=positions,
+        pixel_values=pixel_values,
+        vision_grid=vision_grid,
+        padding_mask=padding_mask,
+        completion_mask=completion_mask,
+        advantages=advantages,
+        old_per_token_logps=old_per_token_logps,
+    )
+  if batch_size % MICRO_BSZ != 0:
+    raise ValueError(
+        'QWEN3VL_MICRO_BSZ must divide the encoded batch size when'
+        f' accumulation is active; got MICRO_BSZ={MICRO_BSZ}, B={batch_size}.'
+    )
+
+  n_accum = batch_size // MICRO_BSZ
+  total_loss = jnp.asarray(0.0, dtype=jnp.float32)
+  accumulated_grads = None
+  if LOSS_ALGO != 'gspo':
+    total_token_count = jnp.clip(
+        jnp.sum(completion_mask[:, 1:].astype(jnp.float32)), min=1.0
+    )
+
+  for mb_idx in range(n_accum):
+    mb_start = mb_idx * MICRO_BSZ
+    mb_end = mb_start + MICRO_BSZ
+    patch_start = int(patch_offsets[mb_start])
+    patch_end = int(patch_offsets[mb_end])
+    micro_completion_mask = completion_mask[mb_start:mb_end]
+    micro_loss, micro_grads = _micro_grad_fn(
+        model,
+        input_tokens[mb_start:mb_end],
+        positions[:, mb_start:mb_end, :],
+        pixel_values[patch_start:patch_end],
+        _slice_vision_grid(
+            vision_grid,
+            seq_start=mb_start,
+            seq_end=mb_end,
+            patch_start=patch_start,
+            patch_end=patch_end,
+        ),
+        padding_mask[mb_start:mb_end],
+        micro_completion_mask,
+        advantages[mb_start:mb_end],
+        old_per_token_logps[mb_start:mb_end],
+    )
+
+    if LOSS_ALGO == 'gspo':
+      # GSPO is seq-mean-token-mean. Because startup validation requires equal
+      # sequence-count micro-batches, averaging micro losses/grads is exactly the
+      # gradient of the full batch mean over B sequences.
+      loss_scale = jnp.asarray(1.0 / n_accum, dtype=jnp.float32)
+    else:
+      # GRPO is a global token mean: full loss is sum(all token losses) divided
+      # by total completion tokens. A micro loss has already divided by its own
+      # token count, so weight its loss/grads by micro_tokens / total_tokens.
+      micro_token_count = jnp.sum(
+          micro_completion_mask[:, 1:].astype(jnp.float32)
+      )
+      loss_scale = micro_token_count / total_token_count
+
+    micro_grads = jax.tree.map(lambda grad: grad * loss_scale, micro_grads)
+    accumulated_grads = (
+        micro_grads
+        if accumulated_grads is None
+        else jax.tree.map(
+            lambda lhs, rhs: lhs + rhs, accumulated_grads, micro_grads
+        )
+    )
+    total_loss = total_loss + micro_loss * loss_scale
+
+  _apply_accumulated_grads(model, optimizer, accumulated_grads)
+  return total_loss
+
+
 def _shard_optimizer_state(optimizer: nnx.Optimizer, mesh: jax.sharding.Mesh):
   """Apply sharding constraints to the optimizer state. Mirrors
   ``tunix.sft.peft_trainer.PeftTrainer._shard_optimizer``. Without this,
@@ -610,6 +824,7 @@ def main():
           'loss_algo': LOSS_ALGO, 'num_iterations': NUM_ITERATIONS,
           'clip_low': CLIP_LOW, 'clip_high': CLIP_HIGH, 'clip_c': CLIP_C,
           'lr': LEARNING_RATE, 'grad_clip': GRAD_CLIP,
+          'micro_bsz': MICRO_BSZ,
           'num_prompts': NUM_PROMPTS, 'num_generations': NUM_GENERATIONS,
           'max_new_tokens': MAX_NEW_TOKENS, 'max_seq_len': MAX_SEQ_LEN,
           'max_steps': MAX_STEPS, 'mesh_shape': os.environ.get('QWEN3VL_MESH_SHAPE', ''),
@@ -855,24 +1070,33 @@ def main():
         ' num_iterations=%d lr=%.2g', NUM_ITERATIONS, LEARNING_RATE,
     )
 
+  if _micro_accumulation_active(TRAIN_BATCH_SIZE):
+    logger.info(
+        '[micro-batch] gradient accumulation enabled: micro_bsz=%d B=%d'
+        ' n_accum=%d',
+        MICRO_BSZ, TRAIN_BATCH_SIZE, TRAIN_BATCH_SIZE // MICRO_BSZ,
+    )
+
   # Multi-host SPMD requires identical policy-loss config on every process:
-  # LOSS_ALGO drives a jit-time Python branch and NUM_ITERATIONS drives the
-  # number of donated train-step calls, so a per-host divergence compiles
-  # different programs and silent-dies (same failure class as the step-1
-  # prompt_seq_len drift guard). Assert uniformity loudly before the first jit.
+  # LOSS_ALGO drives a jit-time Python branch, while NUM_ITERATIONS and MICRO_BSZ
+  # drive Python loop counts, so a per-host divergence compiles different
+  # programs and silent-dies (same failure class as the step-1 prompt_seq_len
+  # drift guard). Assert uniformity loudly before the first jit.
   if jax.process_count() > 1:
     local_cfg = jnp.asarray(
         [1.0 if LOSS_ALGO == 'gspo' else 0.0, float(NUM_ITERATIONS),
-         CLIP_LOW, CLIP_HIGH, CLIP_C],
+         CLIP_LOW, CLIP_HIGH, CLIP_C, float(MICRO_BSZ)],
         dtype=jnp.float32,
     )
     all_cfg = np.asarray(multihost_utils.process_allgather(local_cfg))
     if not np.all(all_cfg == all_cfg[0]):
       raise RuntimeError(
           'policy-loss config differs across hosts (rows ='
-          f' [algo, iters, clip_low, clip_high, clip_c]): {all_cfg.tolist()}.'
+          ' [algo, iters, clip_low, clip_high, clip_c, micro_bsz]):'
+          f' {all_cfg.tolist()}.'
           ' All workers must export identical QWEN3VL_LOSS_ALGO /'
-          ' NUM_ITERATIONS / CLIP_* — divergence silent-dies under SPMD.'
+          ' NUM_ITERATIONS / CLIP_* / QWEN3VL_MICRO_BSZ — divergence'
+          ' silent-dies under SPMD.'
       )
     logger.info('[policy-loss] config uniform across %d hosts', all_cfg.shape[0])
 
@@ -1120,6 +1344,21 @@ def main():
     enc_pixel_values = jnp.array(encoded.pixel_values, dtype=jnp.bfloat16)
     enc_padding_mask = jnp.array(encoded.input_mask).astype(jnp.bool_)
     enc_completion_mask = jnp.array(encoded.completion_mask)
+    batch_size = enc_input_tokens.shape[0]
+    micro_accum_active = _micro_accumulation_active(batch_size)
+    if micro_accum_active:
+      if batch_size != TRAIN_BATCH_SIZE:
+        raise ValueError(
+            'encoded train batch size differs from NUM_PROMPTS*NUM_GENERATIONS;'
+            f' encoded B={batch_size}, configured B={TRAIN_BATCH_SIZE}.'
+        )
+      micro_patch_offsets = _vision_patch_offsets_per_sequence(
+          encoded.vision_grid,
+          batch_size=batch_size,
+          total_patches=enc_pixel_values.shape[0],
+      )
+    else:
+      micro_patch_offsets = None
 
     # 7. Grad step(s) (jitted, optimizer donated in place).
     with mesh:
@@ -1145,18 +1384,33 @@ def main():
       # on-policy (ratio == 1); iterations >=1 are off-policy, where GSPO's
       # sequence-level clip takes effect. GRPO uses NUM_ITERATIONS=1.
       for _inner_it in range(NUM_ITERATIONS):
-        loss = _train_step(
-            model,
-            optimizer,
-            input_tokens=enc_input_tokens,
-            positions=enc_positions,
-            pixel_values=enc_pixel_values,
-            vision_grid=encoded.vision_grid,
-            padding_mask=enc_padding_mask,
-            completion_mask=enc_completion_mask,
-            advantages=advantages,
-            old_per_token_logps=old_per_token_logps,
-        )
+        if micro_accum_active:
+          loss = _train_step_accum(
+              model,
+              optimizer,
+              input_tokens=enc_input_tokens,
+              positions=enc_positions,
+              pixel_values=enc_pixel_values,
+              vision_grid=encoded.vision_grid,
+              padding_mask=enc_padding_mask,
+              completion_mask=enc_completion_mask,
+              advantages=advantages,
+              old_per_token_logps=old_per_token_logps,
+              patch_offsets=micro_patch_offsets,
+          )
+        else:
+          loss = _train_step(
+              model,
+              optimizer,
+              input_tokens=enc_input_tokens,
+              positions=enc_positions,
+              pixel_values=enc_pixel_values,
+              vision_grid=encoded.vision_grid,
+              padding_mask=enc_padding_mask,
+              completion_mask=enc_completion_mask,
+              advantages=advantages,
+              old_per_token_logps=old_per_token_logps,
+          )
     rollout.sync_from_actor(nnx.state(model, nnx.Param))
     logger.info(
         '[step %d] loss=%.4f (algo=%s iters=%d)',
