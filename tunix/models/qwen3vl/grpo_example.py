@@ -625,8 +625,8 @@ def _vision_patch_offsets_per_sequence(
     *,
     batch_size: int,
     total_patches: int,
-) -> np.ndarray:
-  """Return [B+1] patch offsets for this trainer's one-image-per-sequence pack."""
+) -> tuple[np.ndarray, np.ndarray]:
+  """Return patch and learned-pos-embed offsets for one image per sequence."""
   offsets = np.asarray(vision_grid.cu_seqlens, dtype=np.int64)
   if offsets.ndim != 1:
     raise ValueError(
@@ -650,7 +650,71 @@ def _vision_patch_offsets_per_sequence(
         f' first={int(offsets[0])}, last={int(offsets[-1])},'
         f' total_patches={total_patches}.'
     )
-  return offsets
+
+  pos_embed_gather = np.asarray(vision_grid.pos_embed_gather, dtype=np.int64)
+  pos_embed_idx = np.asarray(vision_grid.pos_embed_idx)
+  pos_embed_weights = np.asarray(vision_grid.pos_embed_weights)
+  if pos_embed_gather.ndim != 1:
+    raise ValueError(
+        'QWEN3VL_MICRO_BSZ requires 1-D vision_grid.pos_embed_gather; got'
+        f' shape={pos_embed_gather.shape}.'
+    )
+  if int(pos_embed_gather.shape[0]) != total_patches:
+    raise ValueError(
+        'vision_grid.pos_embed_gather does not match packed pixel_values:'
+        f' gather_len={pos_embed_gather.shape[0]}, total_patches={total_patches}.'
+    )
+  if (
+      pos_embed_idx.ndim != 2
+      or pos_embed_weights.ndim != 2
+      or pos_embed_idx.shape[1] != pos_embed_weights.shape[1]
+  ):
+    raise ValueError(
+        'QWEN3VL_MICRO_BSZ requires matching [4, N] pos-embed metadata; got'
+        f' idx={pos_embed_idx.shape}, weights={pos_embed_weights.shape}.'
+    )
+
+  # pos_embed_idx/weights are indexed by the source H*W grid, while
+  # cos/sin/cu_seqlens/pixel_values are indexed by temporal patch rows. Derive
+  # the source-grid slice from pos_embed_gather instead of reusing patch offsets.
+  pos_embed_offsets = np.empty(batch_size + 1, dtype=np.int64)
+  for i in range(batch_size):
+    patch_start = int(offsets[i])
+    patch_end = int(offsets[i + 1])
+    gather_span = pos_embed_gather[patch_start:patch_end]
+    if gather_span.size == 0:
+      raise ValueError(
+          'QWEN3VL_MICRO_BSZ cannot slice an empty vision patch span for'
+          f' sequence {i}.'
+      )
+    pos_start = int(gather_span.min())
+    pos_end = int(gather_span.max()) + 1
+    if pos_start < 0 or pos_end > pos_embed_idx.shape[1]:
+      raise ValueError(
+          'vision_grid.pos_embed_gather points outside pos_embed metadata for'
+          f' sequence {i}: start={pos_start}, end={pos_end},'
+          f' pos_embed_len={pos_embed_idx.shape[1]}.'
+      )
+    if i == 0:
+      pos_embed_offsets[0] = pos_start
+    elif int(pos_embed_offsets[i]) != pos_start:
+      raise ValueError(
+          'QWEN3VL_MICRO_BSZ expects contiguous per-sequence pos-embed spans;'
+          f' sequence {i} starts at {pos_start}, previous ended at'
+          f' {int(pos_embed_offsets[i])}.'
+      )
+    pos_embed_offsets[i + 1] = pos_end
+
+  if (
+      int(pos_embed_offsets[0]) != 0
+      or int(pos_embed_offsets[-1]) != pos_embed_idx.shape[1]
+  ):
+    raise ValueError(
+        'vision_grid pos-embed offsets do not cover the packed metadata:'
+        f' first={int(pos_embed_offsets[0])}, last={int(pos_embed_offsets[-1])},'
+        f' pos_embed_len={pos_embed_idx.shape[1]}.'
+    )
+  return offsets, pos_embed_offsets
 
 
 def _slice_vision_grid(
@@ -660,15 +724,19 @@ def _slice_vision_grid(
     seq_end: int,
     patch_start: int,
     patch_end: int,
+    pos_embed_start: int,
+    pos_embed_end: int,
 ) -> VisionGridData:
   """Slice precomputed vision metadata to match a contiguous pixel patch span."""
   cu_seqlens = vision_grid.cu_seqlens[seq_start : seq_end + 1]
   cu_seqlens = cu_seqlens - cu_seqlens[0]
-  pos_embed_idx = vision_grid.pos_embed_idx[:, patch_start:patch_end]
-  pos_embed_weights = vision_grid.pos_embed_weights[:, patch_start:patch_end]
+  pos_embed_idx = vision_grid.pos_embed_idx[:, pos_embed_start:pos_embed_end]
+  pos_embed_weights = vision_grid.pos_embed_weights[
+      :, pos_embed_start:pos_embed_end
+  ]
   pos_embed_gather = vision_grid.pos_embed_gather[patch_start:patch_end]
   if pos_embed_idx.shape[1] > 0:
-    pos_embed_gather = pos_embed_gather - patch_start
+    pos_embed_gather = pos_embed_gather - pos_embed_start
   return VisionGridData(
       cos=vision_grid.cos[patch_start:patch_end],
       sin=vision_grid.sin[patch_start:patch_end],
@@ -690,7 +758,7 @@ def _train_step_accum(
     completion_mask: jax.Array,
     advantages: jax.Array,
     old_per_token_logps: jax.Array,
-    patch_offsets: np.ndarray,
+    vision_offsets: tuple[np.ndarray, np.ndarray],
 ) -> jax.Array:
   """Micro-batch one logical train step and apply the averaged gradients once."""
   batch_size = input_tokens.shape[0]
@@ -714,6 +782,7 @@ def _train_step_accum(
     )
 
   n_accum = batch_size // MICRO_BSZ
+  patch_offsets, pos_embed_offsets = vision_offsets
   total_loss = jnp.asarray(0.0, dtype=jnp.float32)
   accumulated_grads = None
   if LOSS_ALGO != 'gspo':
@@ -726,6 +795,8 @@ def _train_step_accum(
     mb_end = mb_start + MICRO_BSZ
     patch_start = int(patch_offsets[mb_start])
     patch_end = int(patch_offsets[mb_end])
+    pos_embed_start = int(pos_embed_offsets[mb_start])
+    pos_embed_end = int(pos_embed_offsets[mb_end])
     micro_completion_mask = completion_mask[mb_start:mb_end]
     micro_loss, micro_grads = _micro_grad_fn(
         model,
@@ -738,6 +809,8 @@ def _train_step_accum(
             seq_end=mb_end,
             patch_start=patch_start,
             patch_end=patch_end,
+            pos_embed_start=pos_embed_start,
+            pos_embed_end=pos_embed_end,
         ),
         padding_mask[mb_start:mb_end],
         micro_completion_mask,
@@ -1352,13 +1425,13 @@ def main():
             'encoded train batch size differs from NUM_PROMPTS*NUM_GENERATIONS;'
             f' encoded B={batch_size}, configured B={TRAIN_BATCH_SIZE}.'
         )
-      micro_patch_offsets = _vision_patch_offsets_per_sequence(
+      micro_vision_offsets = _vision_patch_offsets_per_sequence(
           encoded.vision_grid,
           batch_size=batch_size,
           total_patches=enc_pixel_values.shape[0],
       )
     else:
-      micro_patch_offsets = None
+      micro_vision_offsets = None
 
     # 7. Grad step(s) (jitted, optimizer donated in place).
     with mesh:
@@ -1396,7 +1469,7 @@ def main():
               completion_mask=enc_completion_mask,
               advantages=advantages,
               old_per_token_logps=old_per_token_logps,
-              patch_offsets=micro_patch_offsets,
+              vision_offsets=micro_vision_offsets,
           )
         else:
           loss = _train_step(
