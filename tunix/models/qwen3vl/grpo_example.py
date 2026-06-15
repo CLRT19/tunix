@@ -737,11 +737,17 @@ def main():
   _temp = float(os.environ.get('QWEN3VL_TEMPERATURE', '1.0'))
   _top_p_env = os.environ.get('QWEN3VL_TOP_P', '0.95')
   _top_p = None if _top_p_env in ('', 'none', 'None') else float(_top_p_env)
+  # Force vero's sampling and OVERRIDE the model's generation_config.json
+  # (which otherwise clamps to temp=0.7/top_k=20/top_p=0.8 -> low diversity, so
+  # the model rarely samples the <think>/<answer> tag path). vero uses
+  # temp=1.0, top_p=1.0, top_k=-1 (all tokens). -1 disables top-k in vLLM.
+  _top_k = int(os.environ.get('QWEN3VL_TOP_K', '-1'))
   rollout_config = base_rollout.RolloutConfig(
       max_tokens_to_generate=MAX_NEW_TOKENS,
       max_prompt_length=ROLLOUT_PROMPT_LEN,
       temperature=_temp,
       top_p=_top_p,
+      top_k=_top_k,
   )
 
   if ROLLOUT_ENGINE == 'vllm':
@@ -767,6 +773,7 @@ def main():
         max_prompt_length=ROLLOUT_PROMPT_LEN,
         temperature=_temp,
         top_p=_top_p,
+        top_k=_top_k,
         tensor_parallel_size=tp,
         data_parallel_size=dp,
         rollout_vllm_model_version=model_dir,
