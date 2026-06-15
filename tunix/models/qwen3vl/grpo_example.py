@@ -1023,6 +1023,18 @@ def main():
             float(format_rewards[0]),
             _first[:300],
         )
+        # Per-completion format diagnostics: how often does the model emit the
+        # vero <think>/<answer>/\boxed structure? (drives the format reward.)
+        for _ci, _t in enumerate(rollout_out.text):
+          logger.info(
+              '[step %d] compl[%d] start_think=%s has_thinkclose=%s'
+              ' has_answer=%s has_boxed=%s acc=%.2f fmt=%.2f head=%r',
+              step, _ci,
+              _t.lstrip()[:7] == '<think>',
+              '</think>' in _t, '<answer>' in _t, '\\boxed' in _t,
+              float(answer_rewards[_ci]), float(format_rewards[_ci]),
+              _t.lstrip()[:60],
+          )
     else:
       answer_rewards = np.array(
           chartqa_reward.check_answer(
