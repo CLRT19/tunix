@@ -841,6 +841,14 @@ def _train_step_accum(
         )
     )
     total_loss = total_loss + micro_loss * loss_scale
+    logger.info(
+        '[micro-dbg] mb=%d micro_loss=%.6f adv_sum=%.6f adv_absmax=%.6f'
+        ' scale=%.4f',
+        mb_idx, float(micro_loss),
+        float(jnp.sum(advantages[mb_start:mb_end])),
+        float(jnp.max(jnp.abs(advantages[mb_start:mb_end]))),
+        float(loss_scale),
+    )
 
   _apply_accumulated_grads(model, optimizer, accumulated_grads)
   return total_loss
