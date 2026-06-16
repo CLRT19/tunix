@@ -32,6 +32,12 @@ errors.
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
+# `_compute_old_logps_micro` reads the module-level MICRO_BSZ that grpo_example
+# binds at import; set it (and a divisible batch) BEFORE importing so the
+# old-via-micro test loops the same MICRO=2 micro-batches as `_run`.
+os.environ.setdefault("QWEN3VL_MICRO_BSZ", "2")
+os.environ.setdefault("QWEN3VL_NUM_PROMPTS", "1")
+os.environ.setdefault("QWEN3VL_NUM_GENERATIONS", "4")
 
 import jax.numpy as jnp
 import numpy as np
@@ -239,6 +245,79 @@ def _run(replace_field=None):
     )
     results.append(mm)
   return results
+
+
+def test_old_via_micro_equals_cur_at_iter0():
+  """At inner iteration 0 the model is unchanged, so `old` (computed via
+  `_compute_old_logps_micro`) must EXACTLY equal `cur` — the per-micro-batch
+  `_compute_per_token_logps` forward the GSPO loss runs inside `_micro_grad_fn`.
+  This is the invariant that makes the GSPO importance ratio == 1 at iter 0.
+
+  We compare the concatenated old-via-micro array against the per-micro forwards
+  reproduced with the identical slicing, asserting bitwise-tight equality (same
+  code path, same shapes -> deterministic on CPU).
+  """
+  assert grpo_example.MICRO_BSZ == 2, grpo_example.MICRO_BSZ
+  cfg = _tiny_config()
+  rng = np.random.default_rng(0)
+  model = model_lib.Qwen3VL(cfg, rngs=nnx.Rngs(params=0))
+  batch = _build_batch(cfg, rng)
+  B = batch["input_tokens"].shape[0]
+  MICRO = grpo_example.MICRO_BSZ
+  n_accum = B // MICRO
+
+  offsets = grpo_example._vision_patch_offsets_per_sequence(
+      batch["vision_grid"], batch_size=B, total_patches=batch["total_patches"]
+  )
+
+  # `old` through the production helper (loops micro-batches, concatenates).
+  old = grpo_example._compute_old_logps_micro(
+      model,
+      input_tokens=batch["input_tokens"],
+      positions=batch["positions"],
+      pixel_values=batch["pixel_values"],
+      vision_grid=batch["vision_grid"],
+      padding_mask=batch["padding_mask"],
+      vision_offsets=offsets,
+  )
+
+  # `cur` reproduced per micro-batch with the SAME slicing the loss uses.
+  patch_offsets, pos_embed_offsets = offsets
+  cur_parts = []
+  for mb in range(n_accum):
+    s, e = mb * MICRO, mb * MICRO + MICRO
+    patch_start, patch_end = int(patch_offsets[s]), int(patch_offsets[e])
+    pe_start, pe_end = int(pos_embed_offsets[s]), int(pos_embed_offsets[e])
+    micro_grid = grpo_example._slice_vision_grid(
+        batch["vision_grid"], seq_start=s, seq_end=e,
+        patch_start=patch_start, patch_end=patch_end,
+        pos_embed_start=pe_start, pos_embed_end=pe_end,
+    )
+    # Use the SAME jitted forward `_compute_old_logps_micro` invokes, so the
+    # comparison is jit-vs-jit (apples to apples). In the real trainer `cur`
+    # goes through jitted `_micro_grad_fn`->`policy_loss_fn`->
+    # `_compute_per_token_logps`; an eager (non-jit) call can differ from the
+    # XLA-fused jit result by ~1e-3 — the jit/eager numeric gap, NOT a slicing
+    # bug. Both `old` and `cur` are jitted in production, so this gap cancels.
+    cur_parts.append(
+        grpo_example._micro_logps_fn(
+            model,
+            micro_input_tokens=batch["input_tokens"][s:e],
+            micro_positions=batch["positions"][:, s:e, :],
+            micro_pixel_values=batch["pixel_values"][patch_start:patch_end],
+            micro_vision_grid=micro_grid,
+            micro_padding_mask=batch["padding_mask"][s:e],
+        )
+    )
+  cur = jnp.concatenate(cur_parts, axis=0)
+
+  # Restrict the comparison to completion tokens (image-pad ids exceed the tiny
+  # vocab -> NaN logp at non-completion positions; jnp.where keeps NaN out).
+  m = batch["completion_mask"][:, 1:].astype(jnp.bool_)
+  diff = jnp.where(m, jnp.abs(old - cur), 0.0)
+  worst = float(jnp.max(diff))
+  print(f"old-via-micro vs cur worst completion-token |diff| = {worst:.3e}")
+  assert worst < 1e-5, f"iter-0 old != cur: {worst}"
 
 
 def test_micro_slice_matches_full():

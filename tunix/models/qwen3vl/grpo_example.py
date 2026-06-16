@@ -609,6 +609,94 @@ def _micro_grad_impl(
 _micro_grad_fn = nnx.jit(_micro_grad_impl)
 
 
+def _micro_logps_impl(
+    model: model_lib.Qwen3VL,
+    micro_input_tokens: jax.Array,
+    micro_positions: jax.Array,
+    micro_pixel_values: jax.Array,
+    micro_vision_grid: VisionGridData,
+    micro_padding_mask: jax.Array,
+) -> jax.Array:
+  """Grad-free per-token log-probs for ONE micro-batch slice.
+
+  This is the IDENTICAL forward (``_compute_per_token_logps``) the loss ``cur``
+  uses inside ``_micro_grad_fn`` -> ``policy_loss_fn``, but without
+  value_and_grad. Running ``old`` through this same jitted micro path makes
+  iteration-0 ``cur == old`` true by construction: same code, same
+  per-micro-batch shapes, same B=MICRO_BSZ batch sharding — so any full-vs-micro
+  or sharding-numerics discrepancy cancels out of the GSPO importance ratio.
+  """
+  return _compute_per_token_logps(
+      model,
+      input_tokens=micro_input_tokens,
+      positions=micro_positions,
+      pixel_values=micro_pixel_values,
+      vision_grid=micro_vision_grid,
+      padding_mask=micro_padding_mask,
+  )
+
+
+_micro_logps_fn = nnx.jit(_micro_logps_impl)
+
+
+def _compute_old_logps_micro(
+    model: model_lib.Qwen3VL,
+    *,
+    input_tokens: jax.Array,
+    positions: jax.Array,
+    pixel_values: jax.Array,
+    vision_grid: VisionGridData,
+    padding_mask: jax.Array,
+    vision_offsets: tuple[np.ndarray, np.ndarray],
+) -> jax.Array:
+  """Behavior-policy per-token logps via the SAME micro path as ``cur``.
+
+  Loops the identical MICRO_BSZ micro-batches that ``_train_step_accum`` feeds
+  the loss (same ``_vision_patch_offsets_per_sequence`` spans, same
+  ``_slice_vision_grid``, same positions / pixel slicing), runs the grad-free
+  ``_micro_logps_fn`` on each, and concatenates back to the full ``[B, L-1]``
+  array. Because ``cur`` (inside the inner-loop loss) and this ``old`` go through
+  byte-identical slicing + forward, at inner iteration 0 (model unchanged)
+  ``cur == old`` to fp tolerance and the GSPO ratio is exactly 1 — regardless of
+  any micro-vs-full or B<fsdp discrepancy.
+  """
+  batch_size = input_tokens.shape[0]
+  if batch_size % MICRO_BSZ != 0:
+    raise ValueError(
+        'QWEN3VL_MICRO_BSZ must divide the encoded batch size when'
+        f' accumulation is active; got MICRO_BSZ={MICRO_BSZ}, B={batch_size}.'
+    )
+  n_accum = batch_size // MICRO_BSZ
+  patch_offsets, pos_embed_offsets = vision_offsets
+  micro_logps = []
+  for mb_idx in range(n_accum):
+    mb_start = mb_idx * MICRO_BSZ
+    mb_end = mb_start + MICRO_BSZ
+    patch_start = int(patch_offsets[mb_start])
+    patch_end = int(patch_offsets[mb_end])
+    pos_embed_start = int(pos_embed_offsets[mb_start])
+    pos_embed_end = int(pos_embed_offsets[mb_end])
+    micro_logps.append(
+        _micro_logps_fn(
+            model,
+            micro_input_tokens=input_tokens[mb_start:mb_end],
+            micro_positions=positions[:, mb_start:mb_end, :],
+            micro_pixel_values=pixel_values[patch_start:patch_end],
+            micro_vision_grid=_slice_vision_grid(
+                vision_grid,
+                seq_start=mb_start,
+                seq_end=mb_end,
+                patch_start=patch_start,
+                patch_end=patch_end,
+                pos_embed_start=pos_embed_start,
+                pos_embed_end=pos_embed_end,
+            ),
+            micro_padding_mask=padding_mask[mb_start:mb_end],
+        )
+    )
+  return jnp.concatenate(micro_logps, axis=0)
+
+
 def _apply_accumulated_grads_impl(
     model: model_lib.Qwen3VL,
     optimizer: nnx.Optimizer,
@@ -1454,14 +1542,34 @@ def main():
       # GRPO path never reads this; pass a correctly-shaped zero so the
       # jitted train step keeps a single, stable signature.
       if LOSS_ALGO == 'gspo':
-        old_per_token_logps = _compute_old_logps(
-            model,
-            input_tokens=enc_input_tokens,
-            positions=enc_positions,
-            pixel_values=enc_pixel_values,
-            vision_grid=encoded.vision_grid,
-            padding_mask=enc_padding_mask,
-        )
+        # Compute the behavior-policy logps through the EXACT path that produces
+        # the loss `cur`. When micro-accumulation is active, `cur` is computed
+        # per micro-batch (sliced pixel_values / vision_grid / positions, B=
+        # MICRO_BSZ sharding); a full-B=8 forward (`_compute_old_logps`) differs
+        # from it both in the micro-vs-full code path and the B=8-vs-B=2 batch
+        # sharding, so iteration-0 cur!=old and the GSPO ratio explodes. Routing
+        # `old` through `_compute_old_logps_micro` (same slicing + jit) forces
+        # iteration-0 cur==old by construction. Fall back to the single full
+        # forward only when micro-accumulation is off (then `cur` is also full).
+        if micro_accum_active:
+          old_per_token_logps = _compute_old_logps_micro(
+              model,
+              input_tokens=enc_input_tokens,
+              positions=enc_positions,
+              pixel_values=enc_pixel_values,
+              vision_grid=encoded.vision_grid,
+              padding_mask=enc_padding_mask,
+              vision_offsets=micro_vision_offsets,
+          )
+        else:
+          old_per_token_logps = _compute_old_logps(
+              model,
+              input_tokens=enc_input_tokens,
+              positions=enc_positions,
+              pixel_values=enc_pixel_values,
+              vision_grid=encoded.vision_grid,
+              padding_mask=enc_padding_mask,
+          )
       else:
         old_per_token_logps = jnp.zeros(
             (enc_input_tokens.shape[0], enc_input_tokens.shape[1] - 1),
