@@ -959,20 +959,40 @@ class Qwen3VL(BackendMappingMixin, nnx.Module):
       vision_embeds = vision_embeds.cast(
           self.config.param_dtype
       ).with_batch_dim(bsz)
-      # Inject vision tokens at <|image_pad|> positions
+      # Inject vision tokens at <|image_pad|> positions.
+      #
+      # ``vision_embeds.tokens`` is the PACKED concatenation of every
+      # sequence's vision tokens (one image per sequence, in batch order),
+      # broadcast identically across the batch dim by ``with_batch_dim``. Each
+      # sequence therefore has to read its OWN slice of that packed array,
+      # starting at the number of vision tokens that precede it. Reading from
+      # index 0 for every sequence (the old behaviour) is only correct for the
+      # first sequence; with non-uniform / multiple images it injects the wrong
+      # sequence's tokens into every later row.
       visual_mask = input_tokens == jnp.int32(image_pad_id)
+      # Exclusive prefix sum of per-sequence vision-token counts -> the offset
+      # into the packed array at which each sequence's tokens begin.
+      vis_counts = visual_mask.sum(axis=1)  # [B]
+      vis_offsets = jnp.cumsum(vis_counts) - vis_counts  # [B], exclusive
 
-      def _inject(h, tok, vis):
+      def _inject(h, tok, vis, vis_offset):
         num_vis = vis.shape[0]
         pos = jnp.where(
             tok == jnp.int32(image_pad_id), size=num_vis, fill_value=-1
         )[0]
         valid = pos >= 0
         pos = jnp.where(valid, pos, 0)
-        updates = jnp.where(valid[:, None], vis.astype(h.dtype), h[pos])
+        # Gather this sequence's slice of the packed vision tokens: the k-th
+        # pad position takes packed token (vis_offset + k).
+        src = jnp.take(
+            vis, vis_offset + jnp.arange(num_vis), axis=0, mode='clip'
+        )
+        updates = jnp.where(valid[:, None], src.astype(h.dtype), h[pos])
         return h.at[pos].set(updates)
 
-      x = jax.vmap(_inject)(x, input_tokens, vision_embeds.tokens)
+      x = jax.vmap(_inject)(
+          x, input_tokens, vision_embeds.tokens, vis_offsets
+      )
 
     deepstack = vision_embeds.deepstack if vision_embeds else ()
     # `deepstack_visual_indexes` ([8,16,24]) are the VISION-encoder layers the
@@ -996,7 +1016,9 @@ class Qwen3VL(BackendMappingMixin, nnx.Module):
       if cache is not None:
         new_cache[layer_name] = layer_cache  # pytype: disable=container-type-mismatch
       if i in deepstack_map and visual_mask is not None:
-        x = self._apply_deepstack(x, visual_mask, deepstack_map[i])
+        x = self._apply_deepstack(
+            x, visual_mask, deepstack_map[i], vis_offsets
+        )
 
     x = self.final_norm(x)
     if output_hidden_states:
@@ -1018,26 +1040,45 @@ class Qwen3VL(BackendMappingMixin, nnx.Module):
 
   @staticmethod
   def _apply_deepstack(
-      hidden: jax.Array, visual_mask: jax.Array | None, features: jax.Array
+      hidden: jax.Array,
+      visual_mask: jax.Array | None,
+      features: jax.Array,
+      vis_offsets: jax.Array | None = None,
   ) -> jax.Array:
-    """Add deepstack vision features to hidden states at vision token positions"""
+    """Add deepstack vision features to hidden states at vision token positions.
+
+    ``features`` is the PACKED concatenation of every sequence's deepstack
+    features broadcast across the batch dim, so — exactly like the vision-token
+    injection — each sequence must read from its OWN offset into that packed
+    array. ``vis_offsets[b]`` is the exclusive prefix sum of per-sequence
+    vision-token counts; without it later sequences pick up earlier sequences'
+    features whenever images are non-uniform.
+    """
     if visual_mask is None or features.size == 0:
       return hidden
 
-    def _add(h, mask, feat):
+    bsz = hidden.shape[0]
+    if vis_offsets is None:
+      vis_offsets = jnp.zeros((bsz,), dtype=jnp.int32)
+
+    def _add(h, mask, feat, offset):
       if feat.shape[0] == 0:
         return h
-      idx = jnp.where(mask, size=feat.shape[0], fill_value=-1)[0]
+      n = feat.shape[0]
+      idx = jnp.where(mask, size=n, fill_value=-1)[0]
       valid = idx >= 0
       idx = jnp.where(valid, idx, 0)
+      src = jnp.take(feat, offset + jnp.arange(n), axis=0, mode='clip')
       updates = jnp.where(
           valid[:, None],
-          feat.astype(h.dtype),
-          jnp.zeros_like(feat, dtype=h.dtype),
+          src.astype(h.dtype),
+          jnp.zeros_like(src, dtype=h.dtype),
       )
       return h.at[idx].add(updates)
 
-    return jax.vmap(_add)(hidden, visual_mask.astype(bool), features)
+    return jax.vmap(_add)(
+        hidden, visual_mask.astype(bool), features, vis_offsets
+    )
 
   def get_model_input(self):
     """Returns a dummy model input for the transformer.
