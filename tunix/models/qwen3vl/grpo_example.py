@@ -800,10 +800,10 @@ def _train_step_accum(
     micro_completion_mask = completion_mask[mb_start:mb_end]
     micro_loss, micro_grads = _micro_grad_fn(
         model,
-        input_tokens[mb_start:mb_end],
-        positions[:, mb_start:mb_end, :],
-        pixel_values[patch_start:patch_end],
-        _slice_vision_grid(
+        micro_input_tokens=input_tokens[mb_start:mb_end],
+        micro_positions=positions[:, mb_start:mb_end, :],
+        micro_pixel_values=pixel_values[patch_start:patch_end],
+        micro_vision_grid=_slice_vision_grid(
             vision_grid,
             seq_start=mb_start,
             seq_end=mb_end,
@@ -812,10 +812,10 @@ def _train_step_accum(
             pos_embed_start=pos_embed_start,
             pos_embed_end=pos_embed_end,
         ),
-        padding_mask[mb_start:mb_end],
-        micro_completion_mask,
-        advantages[mb_start:mb_end],
-        old_per_token_logps[mb_start:mb_end],
+        micro_padding_mask=padding_mask[mb_start:mb_end],
+        micro_completion_mask=micro_completion_mask,
+        micro_advantages=advantages[mb_start:mb_end],
+        micro_old_per_token_logps=old_per_token_logps[mb_start:mb_end],
     )
 
     if LOSS_ALGO == 'gspo':
@@ -841,14 +841,6 @@ def _train_step_accum(
         )
     )
     total_loss = total_loss + micro_loss * loss_scale
-    logger.info(
-        '[micro-dbg] mb=%d micro_loss=%.6f adv_sum=%.6f adv_absmax=%.6f'
-        ' scale=%.4f',
-        mb_idx, float(micro_loss),
-        float(jnp.sum(advantages[mb_start:mb_end])),
-        float(jnp.max(jnp.abs(advantages[mb_start:mb_end]))),
-        float(loss_scale),
-    )
 
   _apply_accumulated_grads(model, optimizer, accumulated_grads)
   return total_loss
