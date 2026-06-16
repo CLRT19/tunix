@@ -814,13 +814,9 @@ def _train_step_accum(
         ),
         micro_padding_mask=padding_mask[mb_start:mb_end],
         micro_completion_mask=micro_completion_mask,
-        micro_advantages=jnp.zeros_like(advantages[mb_start:mb_end]),  # TEMP force-zero test
+        micro_advantages=advantages[mb_start:mb_end],
         micro_old_per_token_logps=old_per_token_logps[mb_start:mb_end],
     )
-    import numpy as _np  # TEMP
-    logger.info('[mb-zerotest] mb=%d forced_zero_loss=%.6f real_adv=%r',
-                mb_idx, float(micro_loss),
-                _np.asarray(advantages[mb_start:mb_end]).tolist())
 
     if LOSS_ALGO == 'gspo':
       # GSPO is seq-mean-token-mean. Because startup validation requires equal
