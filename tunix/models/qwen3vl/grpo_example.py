@@ -524,6 +524,14 @@ def policy_loss_fn(
   # seq-mean-token-mean: per-sequence token-mean, then batch-mean. With adv==0
   # every per_token_loss is exactly 0 -> loss 0 (no nan).
   seq_loss = per_token_loss.sum(-1) / denom_tok
+  jax.debug.print(
+      '[ploss-dbg] adv[min={amin} max={amax}] logp_finite={lf}/{lt}'
+      ' coef1[min={c1min} max={c1max}] ptl_abs_sum={ptl} seqloss={sl}',
+      amin=jnp.min(adv), amax=jnp.max(adv),
+      lf=jnp.sum(jnp.isfinite(jnp.where(mask_b, per_token_logps, 0.0))),
+      lt=jnp.sum(mask), c1min=jnp.min(coef_1), c1max=jnp.max(coef_1),
+      ptl=jnp.sum(jnp.abs(per_token_loss)), sl=seq_loss.mean(),
+  )
   return seq_loss.mean()
 
 
@@ -798,6 +806,12 @@ def _train_step_accum(
     pos_embed_start = int(pos_embed_offsets[mb_start])
     pos_embed_end = int(pos_embed_offsets[mb_end])
     micro_completion_mask = completion_mask[mb_start:mb_end]
+    _adv_slice = np.asarray(jax.device_get(advantages[mb_start:mb_end]))
+    logger.info(
+        '[micro-dbg] mb=%d adv_slice=%s old_logp_absmax=%.4f',
+        mb_idx, _adv_slice.tolist(),
+        float(jnp.max(jnp.abs(old_per_token_logps[mb_start:mb_end]))),
+    )
     micro_loss, micro_grads = _micro_grad_fn(
         model,
         micro_input_tokens=input_tokens[mb_start:mb_end],
