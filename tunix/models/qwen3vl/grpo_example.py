@@ -163,6 +163,16 @@ CLIP_HIGH = float(os.environ.get('QWEN3VL_CLIP_HIGH', '4e-4'))
 # Safety bound on the log importance ratio before exp (verl clip_ratio_c).
 CLIP_C = float(os.environ.get('QWEN3VL_CLIP_C', '10.0'))
 
+# On-policy GSPO: with a single inner iteration the behaviour policy IS the
+# current policy, so `old == cur` and the importance ratio is identically 1.
+# In that case the loss derives `old` from `stop_gradient(cur)` INTERNALLY,
+# so we never run a separate old-logps forward. That (a) makes the ratio
+# exactly 1 by construction — immune to the full-vs-micro / B<fsdp sharding
+# mismatch that otherwise explodes it — and (b) drops the extra compiled
+# graphs whose cold multi-host compile OOM-killed the host. Off-policy
+# (NUM_ITERATIONS >= 2) still needs a real captured `old` (see the train loop).
+_GSPO_ON_POLICY = NUM_ITERATIONS <= 1
+
 # Metrics JSONL path (primary process writes one JSON object per step). The
 # sidecar pushes it to wandb. Empty / WANDB_MODE=disabled turns metrics off.
 # Default sits next to the checkpoints (on the bucket).
@@ -508,7 +518,12 @@ def policy_loss_fn(
   # cuts those tokens out of BOTH value and gradient, so padding can never leak.
   mask_b = mask > 0
   cur = jnp.where(mask_b, per_token_logps, 0.0)  # [B, L-1], grad only on compl.
-  old = jnp.where(mask_b, old_per_token_logps, 0.0)
+  if _GSPO_ON_POLICY:
+    # old == cur on-policy; stop_gradient so the ratio is 1 in value but carries
+    # the token-level gradient. No separate old-logps forward is run.
+    old = jax.lax.stop_gradient(cur)
+  else:
+    old = jnp.where(mask_b, old_per_token_logps, 0.0)
   denom_tok = jnp.clip(mask.sum(-1), min=1.0)  # [B]
   # Sequence-level, length-normalized log importance ratio (completion only).
   seq_log_ratio = jnp.where(mask_b, cur - old, 0.0).sum(-1) / denom_tok  # [B]
@@ -1539,7 +1554,7 @@ def main():
       # capture the pre-update log-probs ONCE before the inner loop. The
       # GRPO path never reads this; pass a correctly-shaped zero so the
       # jitted train step keeps a single, stable signature.
-      if LOSS_ALGO == 'gspo' and not all_adv_zero:
+      if LOSS_ALGO == 'gspo' and not all_adv_zero and not _GSPO_ON_POLICY:
         # Compute the behavior-policy logps through the EXACT path that produces
         # the loss `cur`. When micro-accumulation is active, `cur` is computed
         # per micro-batch (sliced pixel_values / vision_grid / positions, B=
