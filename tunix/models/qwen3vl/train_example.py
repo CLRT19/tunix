@@ -116,10 +116,30 @@ def _maybe_initialize_jax_distributed():
   timeout_seconds = int(
       os.environ.get('TUNIX_JAX_DISTRIBUTED_INIT_TIMEOUT_SECONDS', '300')
   )
-  logger.info(
-      'Initializing JAX distributed runtime with automatic cluster detection.'
+  # jax.distributed.initialize defaults heartbeat_timeout_seconds=100: if a
+  # worker's coordination agent misses heartbeats for 100s the whole job is
+  # aborted (synchronized, no traceback). A cold XLA compile of the big
+  # multimodal grad graph on the non-primary workers (which never benefit from
+  # the process_id==0-only /tmp compile cache, so they cold-compile every run)
+  # can block past 100s -> the run dies ~mid-compile every time. Raise the
+  # heartbeat + shutdown timeouts generously so long compiles survive.
+  heartbeat_seconds = int(
+      os.environ.get('TUNIX_JAX_DISTRIBUTED_HEARTBEAT_TIMEOUT_SECONDS', '900')
   )
-  jax.distributed.initialize(initialization_timeout=timeout_seconds)
+  shutdown_seconds = int(
+      os.environ.get('TUNIX_JAX_DISTRIBUTED_SHUTDOWN_TIMEOUT_SECONDS', '900')
+  )
+  logger.info(
+      'Initializing JAX distributed runtime with automatic cluster detection'
+      ' (heartbeat_timeout=%ds, shutdown_timeout=%ds).',
+      heartbeat_seconds,
+      shutdown_seconds,
+  )
+  jax.distributed.initialize(
+      initialization_timeout=timeout_seconds,
+      heartbeat_timeout_seconds=heartbeat_seconds,
+      shutdown_timeout_seconds=shutdown_seconds,
+  )
 
 # ---------------------------------------------------------------------------
 # Model ID / directory resolution
