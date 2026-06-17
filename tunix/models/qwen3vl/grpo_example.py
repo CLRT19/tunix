@@ -524,14 +524,6 @@ def policy_loss_fn(
   # seq-mean-token-mean: per-sequence token-mean, then batch-mean. With adv==0
   # every per_token_loss is exactly 0 -> loss 0 (no nan).
   seq_loss = per_token_loss.sum(-1) / denom_tok
-  jax.debug.print(
-      '[ploss-dbg] adv[min={amin} max={amax}] logp_finite={lf}/{lt}'
-      ' coef1[min={c1min} max={c1max}] ptl_abs_sum={ptl} seqloss={sl}',
-      amin=jnp.min(adv), amax=jnp.max(adv),
-      lf=jnp.sum(jnp.isfinite(jnp.where(mask_b, per_token_logps, 0.0))),
-      lt=jnp.sum(mask), c1min=jnp.min(coef_1), c1max=jnp.max(coef_1),
-      ptl=jnp.sum(jnp.abs(per_token_loss)), sl=seq_loss.mean(),
-  )
   return seq_loss.mean()
 
 
@@ -894,12 +886,6 @@ def _train_step_accum(
     pos_embed_start = int(pos_embed_offsets[mb_start])
     pos_embed_end = int(pos_embed_offsets[mb_end])
     micro_completion_mask = completion_mask[mb_start:mb_end]
-    _adv_slice = np.asarray(jax.device_get(advantages[mb_start:mb_end]))
-    logger.info(
-        '[micro-dbg] mb=%d adv_slice=%s old_logp_absmax=%.4f',
-        mb_idx, _adv_slice.tolist(),
-        float(jnp.max(jnp.abs(old_per_token_logps[mb_start:mb_end]))),
-    )
     micro_loss, micro_grads = _micro_grad_fn(
         model,
         micro_input_tokens=input_tokens[mb_start:mb_end],
@@ -1536,12 +1522,24 @@ def main():
       micro_vision_offsets = None
 
     # 7. Grad step(s) (jitted, optimizer donated in place).
+    # When every advantage is exactly zero (all completions in every group
+    # scored identically) there is no learning signal: the policy-gradient loss
+    # and its gradient are both zero. Skip the optimizer step entirely — this is
+    # equivalent to the (zero) update but avoids any spurious gradient from the
+    # B<fsdp micro-batch forward on the indivisible mesh, and saves the compute.
+    all_adv_zero = float(np.abs(advantages_np).max()) == 0.0
+    if all_adv_zero:
+      logger.info(
+          '[step %d] all advantages zero — skipping optimizer step (no signal)',
+          step,
+      )
+    loss = jnp.asarray(0.0, dtype=jnp.float32)
     with mesh:
       # GSPO measures its importance ratio against the behavior policy, so
       # capture the pre-update log-probs ONCE before the inner loop. The
       # GRPO path never reads this; pass a correctly-shaped zero so the
       # jitted train step keeps a single, stable signature.
-      if LOSS_ALGO == 'gspo':
+      if LOSS_ALGO == 'gspo' and not all_adv_zero:
         # Compute the behavior-policy logps through the EXACT path that produces
         # the loss `cur`. When micro-accumulation is active, `cur` is computed
         # per micro-batch (sliced pixel_values / vision_grid / positions, B=
@@ -1578,7 +1576,7 @@ def main():
       # NUM_ITERATIONS optimizer steps reusing this rollout. Iteration 0 is
       # on-policy (ratio == 1); iterations >=1 are off-policy, where GSPO's
       # sequence-level clip takes effect. GRPO uses NUM_ITERATIONS=1.
-      for _inner_it in range(NUM_ITERATIONS):
+      for _inner_it in range(0 if all_adv_zero else NUM_ITERATIONS):
         if micro_accum_active:
           loss = _train_step_accum(
               model,
