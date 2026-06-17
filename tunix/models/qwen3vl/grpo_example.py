@@ -719,6 +719,25 @@ _apply_accumulated_grads = nnx.jit(
 )
 
 
+@nnx.jit
+def _scale_grads(grads: Any, scale: jax.Array) -> Any:
+  """Scale a whole gradient pytree by a scalar in ONE fused kernel."""
+  return jax.tree.map(lambda g: g * scale, grads)
+
+
+@nnx.jit
+def _accumulate_scaled_grads(acc: Any, grads: Any, scale: jax.Array) -> Any:
+  """``acc + grads * scale`` over the whole pytree in ONE fused kernel.
+
+  Doing the grad-accumulation scale/add with ``jax.tree.map`` EAGERLY (outside
+  jit) dispatches a separate tiny kernel per parameter per micro-batch — for an
+  8B model that is hundreds of un-cached ``jit_multiply`` / ``jit_add``
+  compiles every step, which on the multi-host mesh stalls long enough to abort
+  the run. Folding them into one jitted kernel compiles once and is reused.
+  """
+  return jax.tree.map(lambda a, g: a + g * scale, acc, grads)
+
+
 def _micro_accumulation_active(batch_size: int) -> bool:
   return MICRO_BSZ > 0 and MICRO_BSZ < batch_size
 
@@ -935,13 +954,12 @@ def _train_step_accum(
       )
       loss_scale = micro_token_count / total_token_count
 
-    micro_grads = jax.tree.map(lambda grad: grad * loss_scale, micro_grads)
+    # Scale + accumulate the grad pytree in ONE jitted kernel (not eager
+    # per-parameter tree.map — that compile-storms the multi-host run).
     accumulated_grads = (
-        micro_grads
+        _scale_grads(micro_grads, loss_scale)
         if accumulated_grads is None
-        else jax.tree.map(
-            lambda lhs, rhs: lhs + rhs, accumulated_grads, micro_grads
-        )
+        else _accumulate_scaled_grads(accumulated_grads, micro_grads, loss_scale)
     )
     total_loss = total_loss + micro_loss * loss_scale
 
