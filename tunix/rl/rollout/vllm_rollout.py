@@ -14,8 +14,10 @@
 
 """vLLM rollout worker with Tunix sampler."""
 
+import os
 from typing import Any, Dict, Optional, Tuple
 
+from absl import logging
 from flax import nnx
 import jax
 from jax.experimental import multihost_utils
@@ -98,8 +100,15 @@ class VllmRollout(base_rollout.BaseRollout):
     # params first — load_checkpoint goes straight to the sampler's
     # update_params (no allgather there), and reshard can't handle a
     # non-fully-addressable input.
-    state = _gather_non_addressable_params(nnx.state(model))
-    self._sampler.load_checkpoint(state)
+    if os.environ.get("TUNIX_VLLM_SKIP_INITIAL_LOAD_CHECKPOINT") == "1":
+      logging.warning(
+          "Skipping initial actor->vLLM checkpoint load because "
+          "TUNIX_VLLM_SKIP_INITIAL_LOAD_CHECKPOINT=1. This is intended for "
+          "diagnostics only; rollout weights will remain at vLLM init state."
+      )
+    else:
+      state = _gather_non_addressable_params(nnx.state(model))
+      self._sampler.load_checkpoint(state)
     self._pending_images = None
 
   @property
