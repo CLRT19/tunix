@@ -346,13 +346,14 @@ def load_and_create_model_opt(
   file_handles = []
   for f in files:
     contiguous_array, tensor_metadata, mm, fh = load_safetensors_with_offsets(f)
-    arrays.append((contiguous_array, tensor_metadata))
+    arrays.append((str(f), contiguous_array, tensor_metadata))
     mmaps.append(mm)
     file_handles.append(fh)
 
   state_dict = {}
+  state_sources = {}
   skipped_keys = []
-  for array, metadata_list in arrays:
+  for source_file, array, metadata_list in arrays:
     for metadata in metadata_list:
       try:
         jax_key_mapped, transform = torch_key_to_jax_key(
@@ -372,6 +373,7 @@ def load_and_create_model_opt(
         if reshape:
           parameter = parameter.reshape(reshape)
       state_dict[jax_key_mapped] = parameter
+      state_sources[jax_key_mapped] = (source_file, metadata['name'])
 
     if skipped_keys:
       logging.warning(
@@ -386,13 +388,40 @@ def load_and_create_model_opt(
     state_dict = preprocess_fn(state_dict)
 
   def shard_state(state_dict):
+    leaf_counter = {'value': 0}
+    log_leaves = os.environ.get(
+        'QWEN3VL_SAFETENSORS_LEAF_LOG', '0'
+    ) in ('1', 'true', 'True')
+
     def _shard_state(path, sharding):
       key = path_to_key(path)
+      leaf_index = leaf_counter['value']
+      leaf_counter['value'] += 1
       tensor = state_dict[key]
       if dtype is not None:
         np_dtype = to_np_dtype(dtype)
         tensor = tensor.astype(np_dtype)
-      return jax.device_put(tensor, sharding)
+      if log_leaves:
+        logging.warning(
+            '[shard leaf BEFORE] proc=%d leaf=%d path=%s shape=%s dtype=%s '
+            'sharding=%s source=%s',
+            jax.process_index(),
+            leaf_index,
+            key,
+            getattr(tensor, 'shape', None),
+            getattr(tensor, 'dtype', None),
+            sharding,
+            state_sources.get(key),
+        )
+      result = jax.device_put(tensor, sharding)
+      if log_leaves:
+        logging.warning(
+            '[shard leaf AFTER] proc=%d leaf=%d path=%s',
+            jax.process_index(),
+            leaf_index,
+            key,
+        )
+      return result
 
     return _shard_state
 
