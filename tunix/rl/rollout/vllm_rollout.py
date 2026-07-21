@@ -167,7 +167,7 @@ class VllmRollout(base_rollout.BaseRollout):
         **sampling_kwargs,
     )
 
-    return base_rollout.RolloutOutput(
+    output = base_rollout.RolloutOutput(
         text=self.output.text,
         logits=None,
         tokens=self.output.tokens,
@@ -177,6 +177,13 @@ class VllmRollout(base_rollout.BaseRollout):
         # across hosts (SPMD). Matches vanilla rollout's contract.
         prompt_seq_len=int(self.output.padded_prompt_tokens.shape[1]),
     )
+    # RolloutOutput predates termination metadata, but standalone evaluation
+    # needs to distinguish EOS from max-token truncation. Preserve it as a
+    # backward-compatible dynamic attribute, matching Qwen3VLRolloutOutput.
+    terminated = getattr(self._sampler, "last_terminated", None)
+    if terminated:
+      output.terminated = terminated[0]
+    return output
 
   def get_per_token_logps(
       self,

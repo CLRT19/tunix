@@ -338,12 +338,18 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
     decoded_outputs = [[] for _ in range(generations)]
     out_logprobs = [[] for _ in range(generations)]
     out_tokens = [[] for _ in range(generations)]
+    terminated = [[] for _ in range(generations)]
     for input_string, multi_sampling_output in zip(
         input_strings, request_outputs
     ):
       for idx, single_output in enumerate(multi_sampling_output.outputs):
         # vLLM still returns 1 eos id even if we ask it to stop at eos.
-        if single_output.token_ids[-1] == self.tokenizer.eos_id():
+        ended_with_eos = bool(
+            single_output.token_ids
+            and single_output.token_ids[-1] == self.tokenizer.eos_id()
+        )
+        terminated[idx].append(ended_with_eos)
+        if ended_with_eos:
           single_output.token_ids = single_output.token_ids[:-1]
           single_output.logprobs = single_output.logprobs[:-1]
 
@@ -362,6 +368,9 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
             input_string,
             decoded_outputs[idx][-1],
         )
+    # Keep EOS termination metadata even though raw completion tokens retain
+    # Tunix's historical EOS-stripped representation.
+    self.last_terminated = terminated
     return decoded_outputs, out_logprobs, out_tokens
 
   def _generate_server_mode(
