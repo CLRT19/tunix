@@ -413,7 +413,23 @@ def load_and_create_model_opt(
             sharding,
             state_sources.get(key),
         )
-      result = jax.device_put(tensor, sharding)
+      # A NumPy value passed directly to device_put with a global sharding
+      # makes multi-controller JAX call multihost_utils.assert_equal. That
+      # all-gathers and compares the full tensor on every host before placing
+      # each leaf; for an 8B model on 16 hosts this can spend tens of minutes
+      # comparing 16 copies per leaf. The callback API asks this process only
+      # for its addressable device slices and constructs the same global array
+      # without the redundant equality all-gather.
+      if isinstance(sharding, jax.sharding.Sharding):
+        result = jax.make_array_from_callback(
+            tensor.shape,
+            sharding,
+            lambda index, tensor=tensor: tensor[index],
+        )
+      else:
+        # Single-device model construction uses a Device rather than a
+        # Sharding and has no cross-host equality check to avoid.
+        result = jax.device_put(tensor, sharding)
       if log_leaves:
         logging.warning(
             '[shard leaf AFTER] proc=%d leaf=%d path=%s',
