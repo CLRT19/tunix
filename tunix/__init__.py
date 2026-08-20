@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tunix API."""
+"""Tunix package metadata.
+
+Public APIs are imported from their defining submodules so importing one Tunix
+utility does not eagerly load every training stack.
+"""
 
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
@@ -21,47 +25,3 @@ try:
   __version__ = version("google-tunix")  # match the name in pyproject.toml
 except PackageNotFoundError:
   __version__ = "0.0.0.dev0"  # fallback for editable installs
-
-
-# pylint: disable=g-multiple-import, g-importing-member
-
-from tunix.distillation.distillation_trainer import DistillationTrainer
-from tunix.distillation.distillation_trainer import TrainingConfig as DistillationTrainingConfig
-from tunix.generate.sampler import CacheConfig
-from tunix.generate.sampler import Sampler
-from tunix.generate.tokenizer_adapter import TokenizerAdapter, Tokenizer
-from tunix.perf.export import PerfMetricsExport
-from tunix.perf.metrics import PerfMetricsConfig
-from tunix.perf.metrics import PerfSpanQuery
-from tunix.rl.agentic.agentic_grpo_learner import GRPOConfig as AgenticGRPOConfig
-from tunix.rl.agentic.agentic_grpo_learner import GRPOLearner as AgenticGRPOLearner
-from tunix.rl.grpo.grpo_learner import GRPOConfig
-from tunix.rl.grpo.grpo_learner import GrpoConfig
-from tunix.rl.grpo.grpo_learner import GRPOLearner
-from tunix.rl.grpo.grpo_learner import GrpoLearner
-from tunix.rl.grpo.grpo_learner import RewardFn
-from tunix.rl.ppo.ppo_learner import PPOConfig
-from tunix.rl.ppo.ppo_learner import PpoConfig
-from tunix.rl.ppo.ppo_learner import PPOLearner
-from tunix.rl.ppo.ppo_learner import PpoLearner
-from tunix.rl.rl_cluster import ClusterConfig
-from tunix.rl.rl_cluster import MetricsBuffer
-from tunix.rl.rl_cluster import RLCluster
-from tunix.rl.rl_cluster import RLTrainingConfig
-from tunix.rl.rl_cluster import Role
-from tunix.rl.rollout.base_rollout import RolloutConfig
-from tunix.sft.checkpoint_manager import CheckpointManager
-from tunix.sft.dpo.dpo_trainer import DPOTrainer
-from tunix.sft.dpo.dpo_trainer import DpoTrainer
-from tunix.sft.dpo.dpo_trainer import DPOTrainingConfig
-from tunix.sft.dpo.dpo_trainer import DpoTrainingConfig
-from tunix.sft.dpo.dpo_trainer import ORPOTrainer
-from tunix.sft.dpo.dpo_trainer import OrpoTrainer
-from tunix.sft.dpo.dpo_trainer import ORPOTrainingConfig
-from tunix.sft.dpo.dpo_trainer import OrpoTrainingConfig
-from tunix.sft.metrics_logger import MetricsLogger
-from tunix.sft.metrics_logger import MetricsLoggerOptions
-from tunix.sft.peft_trainer import PeftTrainer
-from tunix.sft.peft_trainer import TrainingConfig
-
-# pylint: enable=g-multiple-import, g-importing-member

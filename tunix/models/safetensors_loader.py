@@ -346,13 +346,14 @@ def load_and_create_model_opt(
   file_handles = []
   for f in files:
     contiguous_array, tensor_metadata, mm, fh = load_safetensors_with_offsets(f)
-    arrays.append((contiguous_array, tensor_metadata))
+    arrays.append((str(f), contiguous_array, tensor_metadata))
     mmaps.append(mm)
     file_handles.append(fh)
 
   state_dict = {}
+  state_sources = {}
   skipped_keys = []
-  for array, metadata_list in arrays:
+  for source_file, array, metadata_list in arrays:
     for metadata in metadata_list:
       try:
         jax_key_mapped, transform = torch_key_to_jax_key(
@@ -372,6 +373,7 @@ def load_and_create_model_opt(
         if reshape:
           parameter = parameter.reshape(reshape)
       state_dict[jax_key_mapped] = parameter
+      state_sources[jax_key_mapped] = (source_file, metadata['name'])
 
     if skipped_keys:
       logging.warning(
@@ -386,13 +388,56 @@ def load_and_create_model_opt(
     state_dict = preprocess_fn(state_dict)
 
   def shard_state(state_dict):
+    leaf_counter = {'value': 0}
+    log_leaves = os.environ.get(
+        'QWEN3VL_SAFETENSORS_LEAF_LOG', '0'
+    ) in ('1', 'true', 'True')
+
     def _shard_state(path, sharding):
       key = path_to_key(path)
+      leaf_index = leaf_counter['value']
+      leaf_counter['value'] += 1
       tensor = state_dict[key]
       if dtype is not None:
         np_dtype = to_np_dtype(dtype)
         tensor = tensor.astype(np_dtype)
-      return jax.device_put(tensor, sharding)
+      if log_leaves:
+        logging.warning(
+            '[shard leaf BEFORE] proc=%d leaf=%d path=%s shape=%s dtype=%s '
+            'sharding=%s source=%s',
+            jax.process_index(),
+            leaf_index,
+            key,
+            getattr(tensor, 'shape', None),
+            getattr(tensor, 'dtype', None),
+            sharding,
+            state_sources.get(key),
+        )
+      # A NumPy value passed directly to device_put with a global sharding
+      # makes multi-controller JAX call multihost_utils.assert_equal. That
+      # all-gathers and compares the full tensor on every host before placing
+      # each leaf; for an 8B model on 16 hosts this can spend tens of minutes
+      # comparing 16 copies per leaf. The callback API asks this process only
+      # for its addressable device slices and constructs the same global array
+      # without the redundant equality all-gather.
+      if isinstance(sharding, jax.sharding.Sharding):
+        result = jax.make_array_from_callback(
+            tensor.shape,
+            sharding,
+            lambda index, tensor=tensor: tensor[index],
+        )
+      else:
+        # Single-device model construction uses a Device rather than a
+        # Sharding and has no cross-host equality check to avoid.
+        result = jax.device_put(tensor, sharding)
+      if log_leaves:
+        logging.warning(
+            '[shard leaf AFTER] proc=%d leaf=%d path=%s',
+            jax.process_index(),
+            leaf_index,
+            key,
+        )
+      return result
 
     return _shard_state
 
