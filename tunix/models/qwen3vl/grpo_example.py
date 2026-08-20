@@ -1324,7 +1324,7 @@ def main():
     # 2. Tile to NUM_GENERATIONS per prompt.
     questions = [b['question'] for b in batch for _ in range(NUM_GENERATIONS)]
     images = [b['image'] for b in batch for _ in range(NUM_GENERATIONS)]
-    if QWEN3VL_VERO_JSONL:
+    if QWEN3VL_VERO_JSONL or QWEN3VL_VERO_PARQUET_ROOT:
       # Vero JSONL rows carry `ground_truth` + domain/reward_type/extra_info.
       # Tile each by NUM_GENERATIONS, same fan-out pattern as questions/images,
       # so per-completion indices stay aligned.
@@ -1388,7 +1388,7 @@ def main():
     # combines via verl-style `(1 - fs) * acc + fs * fmt`. ChartQA-mode keeps
     # the additive `answer + format` shape that drove the Phase 4 overfit
     # curve — touching that convention would change its dynamics.
-    if QWEN3VL_VERO_JSONL:
+    if QWEN3VL_VERO_JSONL or QWEN3VL_VERO_PARQUET_ROOT:
       from tunix.cli.reward_fn import vero_format
       from tunix.cli.reward_fn import vero_router
       answer_rewards = np.array(
